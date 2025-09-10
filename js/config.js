@@ -1,9 +1,20 @@
 function ConfigPage() {
-  const defaultSettings = { title: "Big Tournament!", currency: "$", payoutPlaces: 5, startingChips: 1500 };
+  const defaultSettings = {
+    title: "Big Tournament!",
+    currency: "$",
+    payoutPlaces: 5,
+    startingChips: 1500,
+    players: "",
+    buyInValue: 1500,
+    addonValue: 500,
+    rebuyValue: 1000,
+    roundTime: "15:00",
+    breakTime: "10:00",
+  };
   const [settings, setSettings] = React.useState(() => {
     try {
       const stored = localStorage.getItem("tournamentSettings");
-      return stored ? JSON.parse(stored) : defaultSettings;
+      return stored ? { ...defaultSettings, ...JSON.parse(stored) } : defaultSettings;
     } catch {
       return defaultSettings;
     }
@@ -41,6 +52,64 @@ function ConfigPage() {
         <label className="flex flex-col">
           <span className="mb-1">Starting Chips</span>
           <input name="startingChips" type="number" value={settings.startingChips} onChange={handleChange} className="text-black px-2 py-1 rounded" />
+        </label>
+        <label className="flex flex-col">
+          <span className="mb-1">Players (one per line)</span>
+          <textarea
+            name="players"
+            value={settings.players}
+            onChange={handleChange}
+            className="text-black px-2 py-1 rounded"
+            rows={5}
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="mb-1">Buy-in Value</span>
+          <input
+            name="buyInValue"
+            type="number"
+            value={settings.buyInValue}
+            onChange={handleChange}
+            className="text-black px-2 py-1 rounded"
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="mb-1">Addon Value</span>
+          <input
+            name="addonValue"
+            type="number"
+            value={settings.addonValue}
+            onChange={handleChange}
+            className="text-black px-2 py-1 rounded"
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="mb-1">Rebuy Value</span>
+          <input
+            name="rebuyValue"
+            type="number"
+            value={settings.rebuyValue}
+            onChange={handleChange}
+            className="text-black px-2 py-1 rounded"
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="mb-1">Round Time (MM:SS)</span>
+          <input
+            name="roundTime"
+            value={settings.roundTime}
+            onChange={handleChange}
+            className="text-black px-2 py-1 rounded"
+          />
+        </label>
+        <label className="flex flex-col">
+          <span className="mb-1">Break Time (MM:SS)</span>
+          <input
+            name="breakTime"
+            value={settings.breakTime}
+            onChange={handleChange}
+            className="text-black px-2 py-1 rounded"
+          />
         </label>
         <button type="submit" className="px-4 py-2 bg-emerald-600 rounded text-white">Save</button>
       </form>

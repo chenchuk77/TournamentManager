@@ -1,21 +1,52 @@
 function TournamentManager() {
-  const defaultSettings = { title: "Big Tournament!", currency: "$", payoutPlaces: 5, startingChips: 1500 };
+  const defaultSettings = {
+    title: "Big Tournament!",
+    currency: "$",
+    payoutPlaces: 5,
+    startingChips: 1500,
+    players: "",
+    buyInValue: 1500,
+    addonValue: 500,
+    rebuyValue: 1000,
+    roundTime: "15:00",
+    breakTime: "10:00",
+  };
   const [settings] = React.useState(() => {
     try {
       const stored = localStorage.getItem("tournamentSettings");
-      return stored ? JSON.parse(stored) : defaultSettings;
+      return stored ? { ...defaultSettings, ...JSON.parse(stored) } : defaultSettings;
     } catch {
       return defaultSettings;
     }
   });
 
+  const players = React.useMemo(() => {
+    return settings.players
+      .split(/\n|,/) // split on newlines or commas
+      .map((p) => p.trim())
+      .filter(Boolean);
+  }, [settings.players]);
+
+  const [rebuys, setRebuys] = React.useState({});
+  const [addons, setAddons] = React.useState({});
+
+  const totalRebuys = Object.values(rebuys).reduce((a, b) => a + b, 0);
+  const totalAddons = Object.values(addons).reduce((a, b) => a + b, 0);
+
+  function parseTime(str) {
+    const [m = 0, s = 0] = (str || "").split(":").map(Number);
+    return (m * 60 + s) * 1000;
+  }
+
+  const roundDuration = React.useMemo(() => parseTime(settings.roundTime), [settings.roundTime]);
+
   const levels = React.useMemo(
     () => [
-      { name: 1, sb: 10, bb: 20, ante: 0, durationMs: 10 * 60 * 1000 },
-      { name: 2, sb: 15, bb: 30, ante: 0, durationMs: 10 * 60 * 1000 },
-      { name: 3, sb: 25, bb: 50, ante: 0, durationMs: 10 * 60 * 1000 },
+      { name: 1, sb: 10, bb: 20, ante: 0, durationMs: roundDuration },
+      { name: 2, sb: 15, bb: 30, ante: 0, durationMs: roundDuration },
+      { name: 3, sb: 25, bb: 50, ante: 0, durationMs: roundDuration },
     ],
-    []
+    [roundDuration]
   );
 
   const [levelIndex, setLevelIndex] = React.useState(0);
@@ -37,11 +68,19 @@ function TournamentManager() {
     return () => clearInterval(id);
   }, [running]);
 
-  const [playersRemaining] = React.useState(37);
-  const [entries] = React.useState({ buyIns: 37 });
-  const [prizePool] = React.useState(1850);
-  const [totalChips] = React.useState(55500);
-  const [nextBreakETA] = React.useState("1:17:28");
+  const playersRemaining = players.length;
+  const entries = React.useMemo(
+    () => ({ buyIns: players.length + totalRebuys }),
+    [players.length, totalRebuys]
+  );
+  const prizePool =
+    players.length * (parseInt(settings.buyInValue, 10) || 0) +
+    totalRebuys * (parseInt(settings.rebuyValue, 10) || 0) +
+    totalAddons * (parseInt(settings.addonValue, 10) || 0);
+  const totalChips =
+    (players.length + totalRebuys + totalAddons) *
+    (parseInt(settings.startingChips, 10) || 0);
+  const nextBreakETA = "-";
 
   function handlePrevLevel() {
     setLevelIndex((i) => Math.max(0, i - 1));
@@ -51,6 +90,15 @@ function TournamentManager() {
   }
   function resetLevelTimer() {
     setRemainingMs(curLevel.durationMs);
+  }
+
+  const [showRebuy, setShowRebuy] = React.useState(false);
+  function openRebuy() {
+    setShowRebuy(true);
+  }
+  function handleRebuy(name) {
+    setRebuys((r) => ({ ...r, [name]: (r[name] || 0) + 1 }));
+    setShowRebuy(false);
   }
 
   return (
@@ -72,8 +120,34 @@ function TournamentManager() {
         onPrev={handlePrevLevel}
         onNext={handleNextLevel}
         onReset={resetLevelTimer}
+        onRebuy={openRebuy}
         payoutPlaces={settings.payoutPlaces}
       />
+      {showRebuy && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center">
+          <div className="bg-white text-black p-4 rounded w-64">
+            <h2 className="text-xl mb-2">Select player</h2>
+            <ul className="flex flex-col gap-2 max-h-64 overflow-auto">
+              {players.map((p) => (
+                <li key={p}>
+                  <button
+                    onClick={() => handleRebuy(p)}
+                    className="w-full px-3 py-1 bg-emerald-600 text-white rounded"
+                  >
+                    {p}
+                  </button>
+                </li>
+              ))}
+            </ul>
+            <button
+              onClick={() => setShowRebuy(false)}
+              className="mt-3 underline"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -96,6 +170,7 @@ function DisplayBoard({
   onNext,
   onReset,
   payoutPlaces,
+  onRebuy,
 }) {
   const isBreak = !!level.break;
   return (
@@ -139,6 +214,7 @@ function DisplayBoard({
       </div>
       <div className="flex gap-2 mt-4 justify-center">
         <button onClick={onPrev} className="px-3 py-2 rounded-xl bg-neutral-700">Prev</button>
+        <button onClick={onRebuy} className="px-3 py-2 rounded-xl bg-neutral-700">Rebuy</button>
         <button onClick={onNext} className="px-3 py-2 rounded-xl bg-neutral-700">Next</button>
       </div>
     </div>
