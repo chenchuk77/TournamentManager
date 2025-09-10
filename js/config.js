@@ -113,8 +113,9 @@ function ConfigPage() {
         </label>
         <button type="submit" className="px-4 py-2 bg-emerald-600 rounded text-white">Save</button>
       </form>
-      <div className="mt-4">
+      <div className="mt-4 flex gap-4">
         <a href="index.html" className="underline">Back</a>
+        <a href="structure.html" className="underline">Structure</a>
       </div>
     </div>
   );

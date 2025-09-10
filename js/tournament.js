@@ -20,6 +20,35 @@ function TournamentManager() {
     }
   });
 
+  const defaultStructure = [
+    { round: 1, ante: 0, sb: 100, bb: 100 },
+    { round: 2, ante: 0, sb: 100, bb: 200 },
+    { round: 3, ante: 0, sb: 100, bb: 300 },
+    { round: 4, ante: 0, sb: 200, bb: 400 },
+    { round: 5, ante: 0, sb: 200, bb: 500 },
+    { round: 6, ante: 0, sb: 300, bb: 600 },
+    { round: 7, ante: 0, sb: 400, bb: 800 },
+    { round: 8, ante: 1000, sb: 500, bb: 1000 },
+    { round: 9, ante: 1200, sb: 600, bb: 1200 },
+    { round: 10, ante: 1600, sb: 800, bb: 1600 },
+    { round: 11, ante: 2000, sb: 1000, bb: 2000 },
+    { round: 12, ante: 2400, sb: 1200, bb: 2400 },
+    { round: 13, ante: 3000, sb: 1500, bb: 3000 },
+    { round: 14, ante: 4000, sb: 2000, bb: 4000 },
+    { round: 15, ante: 5000, sb: 2500, bb: 5000 },
+    { round: 16, ante: 6000, sb: 3000, bb: 6000 },
+    { round: 17, ante: 8000, sb: 4000, bb: 8000 },
+    { round: 18, ante: 10000, sb: 5000, bb: 10000 },
+  ];
+  const [structure] = React.useState(() => {
+    try {
+      const stored = localStorage.getItem("tournamentStructure");
+      return stored ? JSON.parse(stored) : defaultStructure;
+    } catch {
+      return defaultStructure;
+    }
+  });
+
   const players = React.useMemo(() => {
     return settings.players
       .split(/\n|,/) // split on newlines or commas
@@ -41,12 +70,15 @@ function TournamentManager() {
   const roundDuration = React.useMemo(() => parseTime(settings.roundTime), [settings.roundTime]);
 
   const levels = React.useMemo(
-    () => [
-      { name: 1, sb: 10, bb: 20, ante: 0, durationMs: roundDuration },
-      { name: 2, sb: 15, bb: 30, ante: 0, durationMs: roundDuration },
-      { name: 3, sb: 25, bb: 50, ante: 0, durationMs: roundDuration },
-    ],
-    [roundDuration]
+    () =>
+      structure.map((l) => ({
+        name: l.round,
+        sb: l.sb,
+        bb: l.bb,
+        ante: l.ante,
+        durationMs: roundDuration,
+      })),
+    [structure, roundDuration]
   );
 
   const [levelIndex, setLevelIndex] = React.useState(0);
@@ -179,6 +211,7 @@ function DisplayBoard({
         <div>{title}</div>
         <div className="flex items-center gap-4">
           <a href="config.html" className="text-base underline">Config</a>
+          <a href="structure.html" className="text-base underline">Structure</a>
           <div className="text-yellow-300">Players Remaining: {playersRemaining}</div>
         </div>
       </div>
@@ -196,8 +229,13 @@ function DisplayBoard({
       <div className="text-center mt-1 text-4xl font-extrabold">
         {isBreak ? "—" : `Blinds: ${currency}${level.sb} - ${currency}${level.bb}`}
       </div>
+      <div className="text-center mt-1 text-2xl">
+        {isBreak ? "—" : `Ante: ${currency}${level.ante}`}
+      </div>
       <div className="text-center mt-2 text-xl">
-        Next Round: {nextLevel?.break ? "Break" : `NLH`} · Next Blinds: {nextLevel?.break ? "—" : `${currency}${nextLevel?.sb ?? "-"} - ${currency}${nextLevel?.bb ?? "-"}`}
+        Next Round: {nextLevel?.break ? "Break" : `NLH`} · Next: {nextLevel?.break
+          ? "—"
+          : `Blinds ${currency}${nextLevel?.sb ?? "-"} - ${currency}${nextLevel?.bb ?? "-"}, Ante ${currency}${nextLevel?.ante ?? "-"}`}
       </div>
       <div className="grid grid-cols-2 gap-2 mt-6 text-xl">
         <Stat label="# Paid" value={Math.min(entries.buyIns, payoutPlaces || 5)} />
