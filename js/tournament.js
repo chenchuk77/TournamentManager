@@ -21,24 +21,25 @@ function TournamentManager() {
   });
 
   const defaultStructure = [
-    { round: 1, ante: 0, sb: 100, bb: 100 },
-    { round: 2, ante: 0, sb: 100, bb: 200 },
-    { round: 3, ante: 0, sb: 100, bb: 300 },
-    { round: 4, ante: 0, sb: 200, bb: 400 },
-    { round: 5, ante: 0, sb: 200, bb: 500 },
-    { round: 6, ante: 0, sb: 300, bb: 600 },
-    { round: 7, ante: 0, sb: 400, bb: 800 },
-    { round: 8, ante: 1000, sb: 500, bb: 1000 },
-    { round: 9, ante: 1200, sb: 600, bb: 1200 },
-    { round: 10, ante: 1600, sb: 800, bb: 1600 },
-    { round: 11, ante: 2000, sb: 1000, bb: 2000 },
-    { round: 12, ante: 2400, sb: 1200, bb: 2400 },
-    { round: 13, ante: 3000, sb: 1500, bb: 3000 },
-    { round: 14, ante: 4000, sb: 2000, bb: 4000 },
-    { round: 15, ante: 5000, sb: 2500, bb: 5000 },
-    { round: 16, ante: 6000, sb: 3000, bb: 6000 },
-    { round: 17, ante: 8000, sb: 4000, bb: 8000 },
-    { round: 18, ante: 10000, sb: 5000, bb: 10000 },
+    { round: 1, ante: 0, sb: 100, bb: 100, time: 15 },
+    { round: 2, ante: 0, sb: 100, bb: 200, time: 15 },
+    { round: 3, ante: 0, sb: 100, bb: 300, time: 15 },
+    { round: 4, ante: 0, sb: 200, bb: 400, time: 15 },
+    { round: 5, ante: 0, sb: 200, bb: 500, time: 15 },
+    { round: 6, ante: 0, sb: 300, bb: 600, time: 15 },
+    { round: 7, ante: 0, sb: 400, bb: 800, time: 15 },
+    { break: true, time: 10 },
+    { round: 8, ante: 1000, sb: 500, bb: 1000, time: 15 },
+    { round: 9, ante: 1200, sb: 600, bb: 1200, time: 15 },
+    { round: 10, ante: 1600, sb: 800, bb: 1600, time: 15 },
+    { round: 11, ante: 2000, sb: 1000, bb: 2000, time: 15 },
+    { round: 12, ante: 2400, sb: 1200, bb: 2400, time: 15 },
+    { round: 13, ante: 3000, sb: 1500, bb: 3000, time: 15 },
+    { round: 14, ante: 4000, sb: 2000, bb: 4000, time: 15 },
+    { round: 15, ante: 5000, sb: 2500, bb: 5000, time: 15 },
+    { round: 16, ante: 6000, sb: 3000, bb: 6000, time: 15 },
+    { round: 17, ante: 8000, sb: 4000, bb: 8000, time: 15 },
+    { round: 18, ante: 10000, sb: 5000, bb: 10000, time: 15 },
   ];
   const [structure] = React.useState(() => {
     try {
@@ -62,23 +63,28 @@ function TournamentManager() {
   const totalRebuys = Object.values(rebuys).reduce((a, b) => a + b, 0);
   const totalAddons = Object.values(addons).reduce((a, b) => a + b, 0);
 
-  function parseTime(str) {
-    const [m = 0, s = 0] = (str || "").split(":").map(Number);
-    return (m * 60 + s) * 1000;
+  function minutesToMs(min) {
+    return (parseInt(min, 10) || 0) * 60 * 1000;
   }
-
-  const roundDuration = React.useMemo(() => parseTime(settings.roundTime), [settings.roundTime]);
 
   const levels = React.useMemo(
     () =>
-      structure.map((l) => ({
-        name: l.round,
-        sb: l.sb,
-        bb: l.bb,
-        ante: l.ante,
-        durationMs: roundDuration,
-      })),
-    [structure, roundDuration]
+      structure.map((l) =>
+        l.break
+          ? {
+              name: "Break",
+              break: true,
+              durationMs: minutesToMs(l.time),
+            }
+          : {
+              name: l.round,
+              sb: l.sb,
+              bb: l.bb,
+              ante: l.ante,
+              durationMs: minutesToMs(l.time),
+            }
+      ),
+    [structure]
   );
 
   const [levelIndex, setLevelIndex] = React.useState(0);
