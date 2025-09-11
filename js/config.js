@@ -1,4 +1,11 @@
 function ConfigPage() {
+  const defaultPrizes = [
+    { rank: 1, percentage: 50 },
+    { rank: 2, percentage: 30 },
+    { rank: 3, percentage: 20 },
+    { rank: 4, percentage: 0 },
+    { rank: 5, percentage: 0 },
+  ];
   const defaultSettings = {
     title: "Big Tournament!",
     currency: "$",
@@ -10,6 +17,7 @@ function ConfigPage() {
     rebuyValue: 1000,
     roundTime: "15:00",
     breakTime: "10:00",
+    prizes: defaultPrizes,
   };
   const [settings, setSettings] = React.useState(() => {
     try {
@@ -22,8 +30,43 @@ function ConfigPage() {
 
   function handleChange(e) {
     const { name, value } = e.target;
-    setSettings((s) => ({ ...s, [name]: value }));
+    setSettings((s) => {
+      const next = { ...s, [name]: value };
+      if (name === "payoutPlaces") {
+        const count = parseInt(value, 10) || 0;
+        let prizes = [...s.prizes];
+        if (count > prizes.length) {
+          for (let i = prizes.length; i < count; i++) {
+            prizes.push({ rank: i + 1, percentage: 0 });
+          }
+        } else if (count < prizes.length) {
+          prizes = prizes.slice(0, count);
+        }
+        next.prizes = prizes;
+      }
+      return next;
+    });
   }
+
+  function handlePrizeChange(index, percentage) {
+    setSettings((s) => {
+      const prizes = s.prizes.map((p, i) =>
+        i === index ? { ...p, percentage: parseFloat(percentage) || 0 } : p
+      );
+      return { ...s, prizes };
+    });
+  }
+
+  const playersCount = React.useMemo(
+    () =>
+      settings.players
+        .split(/\n|,/)
+        .map((p) => p.trim())
+        .filter(Boolean).length,
+    [settings.players]
+  );
+  const prizePool =
+    playersCount * (parseInt(settings.buyInValue, 10) || 0);
 
   function handleSubmit(e) {
     e.preventDefault();
@@ -111,6 +154,39 @@ function ConfigPage() {
             className="text-black px-2 py-1 rounded"
           />
         </label>
+        <div>
+          <div className="mb-2 font-semibold">Prizes</div>
+          <table className="w-full text-black">
+            <thead>
+              <tr>
+                <th className="text-left">Rank</th>
+                <th className="text-left">%</th>
+                <th className="text-left">Prize</th>
+              </tr>
+            </thead>
+            <tbody>
+              {settings.prizes.map((p, i) => (
+                <tr key={p.rank} className="odd:bg-white/10">
+                  <td className="pr-2">{p.rank}</td>
+                  <td className="pr-2">
+                    <input
+                      type="number"
+                      value={p.percentage}
+                      onChange={(e) => handlePrizeChange(i, e.target.value)}
+                      className="w-16 px-1 py-0.5 rounded"
+                    />
+                  </td>
+                  <td>
+                    {settings.currency}
+                    {formatNumber(
+                      Math.round((prizePool * p.percentage) / 100)
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
         <button type="submit" className="px-4 py-2 bg-emerald-600 rounded text-white">Save</button>
       </form>
       <div className="mt-4 flex gap-4">
@@ -119,6 +195,14 @@ function ConfigPage() {
       </div>
     </div>
   );
+}
+
+function formatNumber(n) {
+  try {
+    return n.toLocaleString();
+  } catch {
+    return String(n);
+  }
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<ConfigPage />);

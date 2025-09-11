@@ -1,4 +1,11 @@
 function TournamentManager() {
+  const defaultPrizes = [
+    { rank: 1, percentage: 50 },
+    { rank: 2, percentage: 30 },
+    { rank: 3, percentage: 20 },
+    { rank: 4, percentage: 0 },
+    { rank: 5, percentage: 0 },
+  ];
   const defaultSettings = {
     title: "Big Tournament!",
     currency: "$",
@@ -10,6 +17,7 @@ function TournamentManager() {
     rebuyValue: 1000,
     roundTime: "15:00",
     breakTime: "10:00",
+    prizes: defaultPrizes,
   };
   const [settings] = React.useState(() => {
     try {
@@ -211,6 +219,21 @@ function DisplayBoard({
   onRebuy,
 }) {
   const isBreak = !!level.break;
+  const [localTime, setLocalTime] = React.useState(
+    () => new Date()
+  );
+  React.useEffect(() => {
+    const id = setInterval(() => setLocalTime(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const localStr = React.useMemo(
+    () =>
+      localTime.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    [localTime]
+  );
   return (
     <div className="rounded-2xl shadow-xl p-4 sm:p-6 bg-black/70 text-white border border-white/10">
       <div className="flex items-center justify-between text-3xl font-bold">
@@ -227,7 +250,8 @@ function DisplayBoard({
         <InfoPill label="# Entries" value={`${entries.buyIns}`} />
       </div>
       <div className="bg-black rounded-xl py-6 text-center">
-        <div className="text-[16vw] leading-none font-black">{fmtMS(remainingMs)}</div>
+        <div className="text-[12vw] leading-none font-black">{fmtMS(remainingMs)}</div>
+        <div className="text-sm mt-1">({localStr})</div>
       </div>
       <div className="text-center mt-4 text-2xl font-semibold">
         {isBreak ? "Break" : "No Limit Texas Hold 'Em"}
