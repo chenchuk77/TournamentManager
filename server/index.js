@@ -28,12 +28,20 @@ const TABLE_CHOICES_SET = new Set(TABLE_CHOICES);
 const TABLE_CALLBACK_PREFIX = 'assign_table:';
 const ROUND_ACK_CALLBACK_PREFIX = 'round_ack:';
 const MAX_TRACKED_ROUNDS = 50;
+const DEALER_ACTION_CALLBACK_PREFIX = 'dealer_action:';
+const DEALER_ACTION_REBUY = 'rebuy';
+const DEALER_ACTION_ELIMINATION = 'elimination';
+const DEALER_ACTIONS = [
+  { key: DEALER_ACTION_REBUY, label: '♻️ Rebuy' },
+  { key: DEALER_ACTION_ELIMINATION, label: '❌ Eliminate Player' }
+];
 
 function generateRoundId() {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
 }
 
 const recentRounds = new Map();
+const pendingDealerActions = new Map();
 
 function rememberRound(record) {
   recentRounds.set(record.id, {
@@ -469,9 +477,331 @@ function buildEliminationMessage(elimination) {
   return parts.join('\n');
 }
 
-bot.start((ctx) => {
+function setPendingDealerAction(telegramId, payload) {
+  if (telegramId === undefined || telegramId === null) {
+    return;
+  }
+  pendingDealerActions.set(String(telegramId), payload);
+}
+
+function getPendingDealerAction(telegramId) {
+  if (telegramId === undefined || telegramId === null) {
+    return undefined;
+  }
+  return pendingDealerActions.get(String(telegramId));
+}
+
+function clearPendingDealerAction(telegramId) {
+  if (telegramId === undefined || telegramId === null) {
+    return;
+  }
+  pendingDealerActions.delete(String(telegramId));
+}
+
+function buildDealerActionKeyboard() {
+  const buttons = DEALER_ACTIONS.map((action) =>
+    Markup.button.callback(action.label, `${DEALER_ACTION_CALLBACK_PREFIX}${action.key}`)
+  );
+  return Markup.inlineKeyboard(buttons, { columns: 1 });
+}
+
+function sendDealerActionMenu(ctx, text = 'Dealer actions') {
+  return ctx.reply(text, buildDealerActionKeyboard());
+}
+
+function getDealerByTelegramId(id) {
+  if (id === undefined || id === null) {
+    return undefined;
+  }
+  const identifier = String(id);
+  return state.getDealers().find((dealer) => dealer.id === identifier);
+}
+
+function splitInputLines(text) {
+  if (text === undefined || text === null) {
+    return [];
+  }
+  return String(text)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
+
+function parseRebuyInput(text) {
+  const lines = splitInputLines(text);
+  if (lines.length === 0) {
+    return { player: null, amount: null, notes: null };
+  }
+
+  const player = toOptionalString(lines.shift());
+  let amount = null;
+  if (lines.length > 0) {
+    const amountCandidate = lines[0];
+    if (/^\$?\d+(?:[.,]\d{1,2})?$/.test(amountCandidate)) {
+      amount = lines.shift();
+    }
+  }
+  const notes = lines.length > 0 ? lines.join('\n') : null;
+  return { player, amount: toOptionalString(amount), notes: toOptionalString(notes) };
+}
+
+function parseEliminationInput(text) {
+  const lines = splitInputLines(text);
+  if (lines.length === 0) {
+    return { player: null, position: null, payout: null, notes: null };
+  }
+
+  const player = toOptionalString(lines.shift());
+  let table = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const tableMatch = lines[index].match(/^t(?:able)?\s*#?\s*:?\s*(.+)$/i);
+    if (tableMatch) {
+      table = normalizeTableValue(tableMatch[1]);
+      lines.splice(index, 1);
+      break;
+    }
+  }
+  let position = null;
+  if (lines.length > 0) {
+    const positionCandidate = lines[0];
+    if (/^#?\d+(?:st|nd|rd|th)?$/i.test(positionCandidate)) {
+      position = positionCandidate.replace(/^#/, '');
+      lines.shift();
+    }
+  }
+
+  let payout = null;
+  if (lines.length > 0) {
+    const payoutCandidate = lines[0];
+    if (/^\$?\d+(?:[.,]\d{1,2})?$/.test(payoutCandidate)) {
+      payout = lines.shift();
+    }
+  }
+
+  const notes = lines.length > 0 ? lines.join('\n') : null;
+  return {
+    player,
+    table: toOptionalString(table),
+    position: toOptionalString(position),
+    payout: toOptionalString(payout),
+    notes: toOptionalString(notes)
+  };
+}
+
+async function submitRebuy(payload = {}) {
+  const normalizedTable = normalizeTableValue(payload.table);
+  if (!normalizedTable) {
+    const error = new Error('Table is required for a rebuy request.');
+    error.status = 400;
+    throw error;
+  }
+
+  const dealer = state.findDealerByTable(normalizedTable);
+  if (!dealer) {
+    const error = new Error(`No dealer is registered for table ${normalizedTable}.`);
+    error.status = 404;
+    throw error;
+  }
+
+  const record = state.recordRebuy({
+    table: dealer.table,
+    player: toOptionalString(payload.player),
+    amount: toOptionalString(payload.amount),
+    notes: toOptionalString(payload.notes)
+  });
+
+  const message = buildRebuyMessage(record);
+  const { notified, failures } = await notifyDealers([dealer], message);
+  return { record, dealer, message, notified, failures };
+}
+
+async function submitElimination(payload = {}) {
+  const player = toOptionalString(payload.player);
+  if (!player) {
+    const error = new Error('Player name is required for eliminations.');
+    error.status = 400;
+    throw error;
+  }
+
+  const record = state.recordElimination({
+    player,
+    table: toOptionalString(payload.table),
+    position: toOptionalString(payload.position),
+    payout: toOptionalString(payload.payout),
+    notes: toOptionalString(payload.notes)
+  });
+
+  const message = buildEliminationMessage(record);
+  const { notified, failures } = await notifyDealers(state.getDealers(), message);
+  return { record, message, notified, failures };
+}
+
+async function handleDealerActionSelection(ctx, actionKey) {
+  const telegramId = ctx.from?.id;
+  if (!telegramId) {
+    await ctx.answerCbQuery('Unable to determine your account.', { show_alert: true });
+    return;
+  }
+
+  const dealer = getDealerByTelegramId(telegramId);
+  const dealerId = String(telegramId);
+  const normalizedAction = String(actionKey || '').toLowerCase();
+
+  if (normalizedAction === DEALER_ACTION_REBUY) {
+    if (!dealer || !dealer.table) {
+      await ctx.answerCbQuery('Assign yourself to a table before requesting a rebuy.', {
+        show_alert: true
+      });
+      return;
+    }
+
+    setPendingDealerAction(telegramId, {
+      type: DEALER_ACTION_REBUY,
+      dealerId,
+      table: dealer.table
+    });
+
+    await ctx.answerCbQuery();
+    const promptLines = [
+      `Enter the player name or seat for the rebuy at table ${dealer.table}.`,
+      'Include amount or notes on additional lines if needed.',
+      'Send /cancel to abort.'
+    ];
+    await ctx.reply(promptLines.join('\n'), Markup.forceReply());
+    return;
+  }
+
+  if (normalizedAction === DEALER_ACTION_ELIMINATION) {
+    setPendingDealerAction(telegramId, {
+      type: DEALER_ACTION_ELIMINATION,
+      dealerId,
+      table: dealer?.table ?? null
+    });
+
+    await ctx.answerCbQuery();
+    const promptLines = [];
+    if (dealer?.table) {
+      promptLines.push(`Enter the player name or seat for the elimination at table ${dealer.table}.`);
+    } else {
+      promptLines.push('Enter the player name or seat for the elimination.');
+      promptLines.push('Include the table number on a new line if needed.');
+    }
+    promptLines.push('Include payout or notes on additional lines if needed.');
+    promptLines.push('Send /cancel to abort.');
+    await ctx.reply(promptLines.join('\n'), Markup.forceReply());
+    return;
+  }
+
+  await ctx.answerCbQuery('Unknown action.', { show_alert: true });
+}
+
+async function handleRebuyText(ctx, pending, text) {
+  const telegramId = ctx.from?.id;
+  const { player, amount, notes } = parseRebuyInput(text);
+
+  if (!player) {
+    await ctx.reply('Please provide a player name or seat for the rebuy.');
+    return false;
+  }
+
+  const table = pending?.table ?? getDealerByTelegramId(telegramId)?.table;
+  if (!table) {
+    clearPendingDealerAction(telegramId);
+    await ctx.reply('You are not assigned to a table. Use /start to choose your table before requesting a rebuy.');
+    return true;
+  }
+
+  try {
+    const result = await submitRebuy({ table, player, amount, notes });
+    clearPendingDealerAction(telegramId);
+
+    const confirmationLines = [`\u267B\uFE0F Rebuy recorded at table ${result.record.table}.`];
+    const effectivePlayer = result.record.player || player;
+    if (effectivePlayer) {
+      confirmationLines.push(`Player: ${effectivePlayer}`);
+    }
+    if (result.record.amount || amount) {
+      confirmationLines.push(`Amount: ${result.record.amount || amount}`);
+    }
+    if (result.record.notes || notes) {
+      confirmationLines.push(result.record.notes || notes);
+    }
+    if (result.failures.length === 0) {
+      confirmationLines.push('Notification sent to your table.');
+    } else {
+      confirmationLines.push('⚠️ Unable to deliver the automatic notification. Please confirm manually.');
+    }
+
+    await ctx.reply(confirmationLines.join('\n'));
+    await sendDealerActionMenu(ctx, 'Dealer actions');
+    return true;
+  } catch (error) {
+    clearPendingDealerAction(telegramId);
+    const message = error?.message || 'Failed to record rebuy.';
+    await ctx.reply(`Failed to record rebuy: ${message}`);
+    await sendDealerActionMenu(ctx, 'Dealer actions');
+    return true;
+  }
+}
+
+async function handleEliminationText(ctx, pending, text) {
+  const telegramId = ctx.from?.id;
+  const parsed = parseEliminationInput(text);
+
+  if (!parsed.player) {
+    await ctx.reply('Please provide the player name or seat for the elimination.');
+    return false;
+  }
+
+  const dealer = getDealerByTelegramId(telegramId);
+  const table = parsed.table || pending?.table || dealer?.table || null;
+
+  try {
+    const result = await submitElimination({
+      player: parsed.player,
+      table,
+      position: parsed.position,
+      payout: parsed.payout,
+      notes: parsed.notes
+    });
+    clearPendingDealerAction(telegramId);
+
+    const confirmationLines = [`\u274C Elimination recorded for ${result.record.player}.`];
+    const effectiveTable = result.record.table || table;
+    if (effectiveTable) {
+      confirmationLines.push(`Table: ${effectiveTable}`);
+    }
+    if (result.record.position || parsed.position) {
+      confirmationLines.push(`Position: ${result.record.position || parsed.position}`);
+    }
+    if (result.record.payout || parsed.payout) {
+      confirmationLines.push(`Payout: ${result.record.payout || parsed.payout}`);
+    }
+    if (result.record.notes || parsed.notes) {
+      confirmationLines.push(result.record.notes || parsed.notes);
+    }
+    if (result.failures.length === 0) {
+      confirmationLines.push('Broadcast sent to all dealers.');
+    } else {
+      confirmationLines.push('⚠️ Some dealers did not receive the broadcast automatically.');
+    }
+
+    await ctx.reply(confirmationLines.join('\n'));
+    await sendDealerActionMenu(ctx, 'Dealer actions');
+    return true;
+  } catch (error) {
+    clearPendingDealerAction(telegramId);
+    const message = error?.message || 'Failed to record elimination.';
+    await ctx.reply(`Failed to record elimination: ${message}`);
+    await sendDealerActionMenu(ctx, 'Dealer actions');
+    return true;
+  }
+}
+
+bot.start(async (ctx) => {
   const keyboard = buildTableKeyboard(ctx.from?.id);
-  return ctx.reply('Choose your table', keyboard);
+  await ctx.reply('Choose your table', keyboard);
+  await sendDealerActionMenu(ctx, 'Dealer actions');
 });
 
 bot.on('callback_query', async (ctx) => {
@@ -491,6 +821,12 @@ bot.on('callback_query', async (ctx) => {
       ctx.from?.id ?? 'unknown',
       summary?.label ?? `round update ${ackId}`
     );
+    return;
+  }
+
+  if (data.startsWith(DEALER_ACTION_CALLBACK_PREFIX)) {
+    const actionKey = data.slice(DEALER_ACTION_CALLBACK_PREFIX.length);
+    await handleDealerActionSelection(ctx, actionKey);
     return;
   }
 
@@ -535,6 +871,21 @@ bot.on('callback_query', async (ctx) => {
   }
 
   await ctx.reply(`You are now assigned to table ${dealer.table}.`);
+  await sendDealerActionMenu(ctx, 'Dealer actions');
+});
+
+bot.command(['menu', 'actions'], async (ctx) => {
+  await sendDealerActionMenu(ctx, 'Dealer actions');
+});
+
+bot.command('cancel', async (ctx) => {
+  const pending = getPendingDealerAction(ctx.from?.id);
+  if (pending) {
+    clearPendingDealerAction(ctx.from?.id);
+    await ctx.reply('Current action cancelled. Use /menu to choose another option.');
+  } else {
+    await ctx.reply('There is no pending action to cancel.');
+  }
 });
 
 bot.command('assign', async (ctx) => {
@@ -570,6 +921,65 @@ bot.command('status', async (ctx) => {
     await ctx.reply(buildRoundMessage(round));
   } else {
     await ctx.reply('The tournament round has not been announced yet.');
+  }
+});
+
+bot.on('text', async (ctx, next) => {
+  const telegramId = ctx.from?.id;
+  if (!telegramId) {
+    if (typeof next === 'function') {
+      await next();
+    }
+    return;
+  }
+
+  const pending = getPendingDealerAction(telegramId);
+  if (!pending) {
+    if (typeof next === 'function') {
+      await next();
+    }
+    return;
+  }
+
+  const text = ctx.message?.text ?? '';
+  const normalized = text.trim();
+  if (!normalized) {
+    await ctx.reply('Please provide a response or send /cancel to abort.');
+    return;
+  }
+
+  if (normalized.toLowerCase() === '/cancel') {
+    clearPendingDealerAction(telegramId);
+    await ctx.reply('Current action cancelled. Use /menu to choose another option.');
+    return;
+  }
+
+  if (normalized.startsWith('/')) {
+    if (typeof next === 'function') {
+      await next();
+    }
+    return;
+  }
+
+  if (pending.type === DEALER_ACTION_REBUY) {
+    const handled = await handleRebuyText(ctx, pending, text);
+    if (!handled && typeof next === 'function') {
+      await next();
+    }
+    return;
+  }
+
+  if (pending.type === DEALER_ACTION_ELIMINATION) {
+    const handled = await handleEliminationText(ctx, pending, text);
+    if (!handled && typeof next === 'function') {
+      await next();
+    }
+    return;
+  }
+
+  clearPendingDealerAction(telegramId);
+  if (typeof next === 'function') {
+    await next();
   }
 });
 
@@ -618,32 +1028,33 @@ app.post('/api/rounds', handleRoundRequest);
 app.post('/round', handleRoundRequest);
 
 app.post('/api/rebuys', async (req, res) => {
-  const { table, player, amount, notes } = req.body;
-  if (!table) {
-    res.status(400).json({ error: 'Table is required for a rebuy request.' });
-    return;
+  try {
+    const { record, notified, failures } = await submitRebuy(req.body || {});
+    res.json({ rebuy: record, notified, failures });
+  } catch (error) {
+    const status = Number.isInteger(error.status) ? error.status : 500;
+    if (status >= 500) {
+      console.error('Failed to process rebuy request:', error);
+    }
+    res
+      .status(status)
+      .json({ error: error.message || 'Failed to process rebuy request.' });
   }
-  const dealer = state.findDealerByTable(table);
-  if (!dealer) {
-    res.status(404).json({ error: `No dealer is registered for table ${table}.` });
-    return;
-  }
-  const record = state.recordRebuy({ table: dealer.table, player, amount, notes });
-  const message = buildRebuyMessage(record);
-  const { notified, failures } = await notifyDealers([dealer], message);
-  res.json({ rebuy: record, notified, failures });
 });
 
 app.post('/api/eliminations', async (req, res) => {
-  const { player, table, position, payout, notes } = req.body;
-  if (!player) {
-    res.status(400).json({ error: 'Player name is required for eliminations.' });
-    return;
+  try {
+    const { record, notified, failures } = await submitElimination(req.body || {});
+    res.json({ elimination: record, notified, failures });
+  } catch (error) {
+    const status = Number.isInteger(error.status) ? error.status : 500;
+    if (status >= 500) {
+      console.error('Failed to process elimination:', error);
+    }
+    res
+      .status(status)
+      .json({ error: error.message || 'Failed to process elimination.' });
   }
-  const record = state.recordElimination({ player, table, position, payout, notes });
-  const message = buildEliminationMessage(record);
-  const { notified, failures } = await notifyDealers(state.getDealers(), message);
-  res.json({ elimination: record, notified, failures });
 });
 
 app.listen(PORT, () => {
