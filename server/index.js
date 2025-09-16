@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
@@ -10,6 +10,22 @@ if (!BOT_TOKEN) {
 
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const PERSIST_PATH = process.env.TOURNAMENT_STATE_FILE || path.join(__dirname, 'tournament-state.json');
+
+function normalizeTableValue(table) {
+  return String(table ?? '').trim();
+}
+
+const DEFAULT_TABLES = Array.from({ length: 10 }, (_, index) => String(index + 1));
+const TABLE_CHOICES = (() => {
+  const configured = (process.env.TOURNAMENT_TABLES || '')
+    .split(',')
+    .map(normalizeTableValue)
+    .filter(Boolean);
+  const base = configured.length > 0 ? configured : DEFAULT_TABLES;
+  return Array.from(new Set(base.map(normalizeTableValue)));
+})();
+const TABLE_CHOICES_SET = new Set(TABLE_CHOICES);
+const TABLE_CALLBACK_PREFIX = 'assign_table:';
 
 class TournamentState {
   constructor(persistPath) {
@@ -180,6 +196,28 @@ async function notifyDealers(dealers, message, extra = {}) {
   return { notified, failures };
 }
 
+function buildTableKeyboard(currentDealerId) {
+  const assignments = new Map();
+  state.getDealers().forEach((dealer) => {
+    if (!dealer.table) {
+      return;
+    }
+    assignments.set(normalizeTableValue(dealer.table), dealer);
+  });
+
+  const buttons = TABLE_CHOICES.map((table) => {
+    const normalized = normalizeTableValue(table);
+    const occupant = assignments.get(normalized);
+    let label = `Table ${normalized}`;
+    if (occupant) {
+      label += occupant.id === String(currentDealerId) ? ' (you)' : ' (taken)';
+    }
+    return Markup.button.callback(label, `${TABLE_CALLBACK_PREFIX}${normalized}`);
+  });
+
+  return Markup.inlineKeyboard(buttons, { columns: 3 });
+}
+
 function buildRoundMessage(round) {
   const parts = [`\uD83C\uDFB4 Round update: ${round.round ?? round.roundNumber ?? round.name ?? ''}`.trim()];
   if (round.blinds) {
@@ -228,26 +266,58 @@ function buildEliminationMessage(elimination) {
   return parts.join('\n');
 }
 
-bot.start(async (ctx) => {
-  await ctx.reply('Welcome! Use /assign <table> to register as a dealer or /unassign to leave your table.');
+bot.start((ctx) => {
+  const keyboard = buildTableKeyboard(ctx.from?.id);
+  return ctx.reply('Choose your table', keyboard);
 });
 
-bot.command('assign', async (ctx) => {
-  const parts = ctx.message.text.split(/\s+/).slice(1);
-  if (parts.length === 0 || !parts[0]) {
-    await ctx.reply('Please specify a table number. Example: /assign 3');
+bot.on('callback_query', async (ctx) => {
+  const data = ctx.callbackQuery?.data;
+  if (!data || !data.startsWith(TABLE_CALLBACK_PREFIX)) {
+    await ctx.answerCbQuery();
     return;
   }
-  const table = parts[0];
+
+  const selectedTable = normalizeTableValue(data.slice(TABLE_CALLBACK_PREFIX.length));
+  if (!selectedTable || !TABLE_CHOICES_SET.has(selectedTable)) {
+    await ctx.answerCbQuery('Unknown table selection.', { show_alert: true });
+    return;
+  }
+
+  const currentUserId = String(ctx.from?.id ?? '');
+  if (!currentUserId) {
+    await ctx.answerCbQuery('Unable to determine your account.', { show_alert: true });
+    return;
+  }
+
+  const existing = state.findDealerByTable(selectedTable);
+  if (existing && existing.id !== currentUserId) {
+    await ctx.answerCbQuery('That table is already taken.', { show_alert: true });
+    return;
+  }
+
   const dealer = state.assignDealer({
     id: ctx.from.id,
-    chatId: ctx.chat.id,
-    table,
+    chatId: ctx.callbackQuery?.message?.chat?.id ?? ctx.from.id,
+    table: selectedTable,
     firstName: ctx.from.first_name,
     lastName: ctx.from.last_name,
     username: ctx.from.username
   });
+
+  await ctx.answerCbQuery(`Assigned to table ${selectedTable}`);
+
+  try {
+    await ctx.editMessageText(`Selected table: ${selectedTable}`);
+  } catch (error) {
+    console.warn('Failed to edit message after table selection:', error);
+  }
+
   await ctx.reply(`You are now assigned to table ${dealer.table}.`);
+});
+
+bot.command('assign', async (ctx) => {
+  await ctx.reply('Please use /start to choose your table from the menu.');
 });
 
 bot.command('unassign', async (ctx) => {
