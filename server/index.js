@@ -26,6 +26,30 @@ const TABLE_CHOICES = (() => {
 })();
 const TABLE_CHOICES_SET = new Set(TABLE_CHOICES);
 const TABLE_CALLBACK_PREFIX = 'assign_table:';
+const ROUND_ACK_CALLBACK_PREFIX = 'round_ack:';
+const MAX_TRACKED_ROUNDS = 50;
+
+function generateRoundId() {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+}
+
+const recentRounds = new Map();
+
+function rememberRound(record) {
+  recentRounds.set(record.id, {
+    label: computeRoundLabel(record)
+  });
+  if (recentRounds.size > MAX_TRACKED_ROUNDS) {
+    const oldestKey = recentRounds.keys().next().value;
+    if (oldestKey) {
+      recentRounds.delete(oldestKey);
+    }
+  }
+}
+
+function getTrackedRoundSummary(id) {
+  return recentRounds.get(id);
+}
 
 class TournamentState {
   constructor(persistPath) {
@@ -120,8 +144,11 @@ class TournamentState {
   }
 
   recordRoundChange(payload) {
+    const data = payload || {};
     const record = {
-      ...payload,
+      ...data,
+      id: data.id ?? generateRoundId(),
+      tables: Array.isArray(data.tables) ? data.tables : [],
       updatedAt: new Date().toISOString()
     };
     this.state.currentRound = record;
@@ -196,6 +223,142 @@ async function notifyDealers(dealers, message, extra = {}) {
   return { notified, failures };
 }
 
+function toOptionalString(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const result = String(value).trim();
+  return result.length > 0 ? result : null;
+}
+
+function toOptionalNumber(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const numberValue = Number(value);
+  return Number.isNaN(numberValue) ? null : numberValue;
+}
+
+function normalizeTables(tables) {
+  if (!Array.isArray(tables)) {
+    return [];
+  }
+  const normalized = tables
+    .map((table) => normalizeTableValue(table))
+    .filter(Boolean);
+  return Array.from(new Set(normalized));
+}
+
+function selectDealersForTables(tables) {
+  const normalized = Array.isArray(tables) ? tables : [];
+  if (normalized.length === 0) {
+    return state.getDealers();
+  }
+  const tableSet = new Set(normalized.map((table) => table.toLowerCase()));
+  return state.getDealers().filter((dealer) => {
+    if (!dealer.table) {
+      return false;
+    }
+    return tableSet.has(normalizeTableValue(dealer.table).toLowerCase());
+  });
+}
+
+function resolveDurationMinutes(payload) {
+  const explicit = toOptionalNumber(payload.durationMinutes);
+  if (explicit !== null) {
+    return explicit;
+  }
+  if (payload.durationMs !== undefined && payload.durationMs !== null && payload.durationMs !== '') {
+    const durationMs = Number(payload.durationMs);
+    if (!Number.isNaN(durationMs) && Number.isFinite(durationMs)) {
+      return Math.round(durationMs / 60000);
+    }
+  }
+  return null;
+}
+
+function prepareRoundRecord(body = {}) {
+  const roundCandidate = body.round ?? body.roundNumber ?? body.name;
+  const roundLabel = toOptionalString(roundCandidate);
+  if (!roundLabel) {
+    const error = new Error('A round identifier (round, roundNumber, or name) is required.');
+    error.status = 400;
+    throw error;
+  }
+
+  const roundNumberValue = toOptionalNumber(
+    body.roundNumber ?? (roundCandidate !== undefined ? roundCandidate : undefined)
+  );
+
+  const nameValue = toOptionalString(body.name);
+  const smallBlindValue = toOptionalString(body.sb ?? body.smallBlind);
+  const bigBlindValue = toOptionalString(body.bb ?? body.bigBlind);
+  const anteValue = toOptionalString(body.ante ?? body.anteAmount);
+  const startTimeValue = toOptionalString(body.startTime);
+  const notesValue = toOptionalString(body.notes);
+  const isBreak = Boolean(body.break || body.isBreak);
+  const durationMinutes = resolveDurationMinutes(body);
+
+  const resolvedBlinds =
+    toOptionalString(body.blinds) ||
+    (smallBlindValue && bigBlindValue ? `${smallBlindValue}/${bigBlindValue}` : null);
+
+  const tables = normalizeTables(body.tables);
+
+  return {
+    record: {
+      round: roundLabel,
+      roundNumber: roundNumberValue,
+      name: nameValue,
+      blinds: resolvedBlinds,
+      smallBlind: smallBlindValue,
+      bigBlind: bigBlindValue,
+      ante: anteValue,
+      startTime: startTimeValue,
+      notes: notesValue,
+      isBreak,
+      durationMinutes,
+      tables
+    },
+    targetTables: tables
+  };
+}
+
+async function announceRoundUpdate(body = {}) {
+  const { record, targetTables } = prepareRoundRecord(body);
+  const storedRecord = state.recordRoundChange(record);
+  rememberRound(storedRecord);
+  const targetDealers = selectDealersForTables(targetTables);
+  const ackCallbackData = `${ROUND_ACK_CALLBACK_PREFIX}${storedRecord.id}`;
+  const ackMarkup = {
+    reply_markup: {
+      inline_keyboard: [[{ text: '✅ Acknowledge', callback_data: ackCallbackData }]]
+    }
+  };
+  const message = buildRoundMessage(storedRecord);
+  const { notified, failures } = await notifyDealers(targetDealers, message, ackMarkup);
+  return {
+    round: storedRecord,
+    notified,
+    failures,
+    dealers: targetDealers.map((dealer) => dealer.id),
+    tables: storedRecord.tables
+  };
+}
+
+async function handleRoundRequest(req, res) {
+  try {
+    const result = await announceRoundUpdate(req.body || {});
+    res.json(result);
+  } catch (error) {
+    const status = Number.isInteger(error.status) ? error.status : 500;
+    if (status >= 500) {
+      console.error('Failed to process round update:', error);
+    }
+    res.status(status).json({ error: error.message || 'Failed to process round update.' });
+  }
+}
+
 function buildTableKeyboard(currentDealerId) {
   const assignments = new Map();
   state.getDealers().forEach((dealer) => {
@@ -218,21 +381,61 @@ function buildTableKeyboard(currentDealerId) {
   return Markup.inlineKeyboard(buttons, { columns: 3 });
 }
 
-function buildRoundMessage(round) {
-  const parts = [`\uD83C\uDFB4 Round update: ${round.round ?? round.roundNumber ?? round.name ?? ''}`.trim()];
-  if (round.blinds) {
-    parts.push(`Blinds: ${round.blinds}`);
+function computeRoundLabel(round) {
+  if (round.isBreak) {
+    return 'Break';
   }
+  const base = round.round ?? round.roundNumber ?? round.name;
+  const label = toOptionalString(base);
+  return label ? `Round ${label}` : 'Round update';
+}
+
+function buildRoundMessage(round) {
+  if (round.isBreak) {
+    const parts = [computeRoundLabel(round)];
+    if (Number.isFinite(round.durationMinutes) && round.durationMinutes !== null) {
+      const minutes = Number(round.durationMinutes);
+      if (!Number.isNaN(minutes)) {
+        const unit = minutes === 1 ? 'minute' : 'minutes';
+        parts.push(`${minutes} ${unit}`);
+      }
+    }
+    const header = parts.join(' — ');
+    const details = [];
+    if (round.notes) {
+      details.push(round.notes);
+    }
+    if (round.startTime) {
+      details.push(`Start time: ${round.startTime}`);
+    }
+    return details.length > 0 ? [header, ...details].join('\n') : header;
+  }
+
+  const headerParts = [];
+  headerParts.push(computeRoundLabel(round));
+  const blindsValue =
+    toOptionalString(round.blinds) ||
+    (toOptionalString(round.smallBlind) && toOptionalString(round.bigBlind)
+      ? `${toOptionalString(round.smallBlind)}/${toOptionalString(round.bigBlind)}`
+      : null);
+  if (blindsValue) {
+    headerParts.push(`Blinds ${blindsValue}`);
+  }
+  let message = headerParts.join(' — ');
+  const details = [];
   if (round.ante) {
-    parts.push(`Ante: ${round.ante}`);
+    details.push(`Ante ${round.ante}`);
   }
   if (round.startTime) {
-    parts.push(`Start time: ${round.startTime}`);
+    details.push(`Start time: ${round.startTime}`);
   }
   if (round.notes) {
-    parts.push(round.notes);
+    details.push(round.notes);
   }
-  return parts.join('\n');
+  if (details.length > 0) {
+    message = [message, ...details].join('\n');
+  }
+  return message;
 }
 
 function buildRebuyMessage(rebuy) {
@@ -273,7 +476,25 @@ bot.start((ctx) => {
 
 bot.on('callback_query', async (ctx) => {
   const data = ctx.callbackQuery?.data;
-  if (!data || !data.startsWith(TABLE_CALLBACK_PREFIX)) {
+  if (!data) {
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  if (data.startsWith(ROUND_ACK_CALLBACK_PREFIX)) {
+    const ackId = data.slice(ROUND_ACK_CALLBACK_PREFIX.length);
+    const summary = getTrackedRoundSummary(ackId);
+    const acknowledgement = summary?.label ? `${summary.label} acknowledged.` : 'Acknowledged.';
+    await ctx.answerCbQuery(acknowledgement);
+    console.log(
+      'Dealer %s acknowledged %s',
+      ctx.from?.id ?? 'unknown',
+      summary?.label ?? `round update ${ackId}`
+    );
+    return;
+  }
+
+  if (!data.startsWith(TABLE_CALLBACK_PREFIX)) {
     await ctx.answerCbQuery();
     return;
   }
@@ -346,7 +567,7 @@ bot.command('status', async (ctx) => {
   }
   const round = state.state.currentRound;
   if (round) {
-    await ctx.reply(`Current round: ${round.round ?? round.roundNumber ?? 'unknown'}\nBlinds: ${round.blinds || 'n/a'}`);
+    await ctx.reply(buildRoundMessage(round));
   } else {
     await ctx.reply('The tournament round has not been announced yet.');
   }
@@ -393,26 +614,8 @@ app.delete('/api/dealers/:id', (req, res) => {
   res.json({ dealer: removed });
 });
 
-app.post('/api/rounds', async (req, res) => {
-  const { round, roundNumber, name, blinds, ante, startTime, notes } = req.body;
-  const identifier = round ?? roundNumber ?? name;
-  if (!identifier) {
-    res.status(400).json({ error: 'A round identifier (round, roundNumber, or name) is required.' });
-    return;
-  }
-  const record = state.recordRoundChange({
-    round: round ?? roundNumber ?? name,
-    roundNumber: roundNumber ?? null,
-    name: name ?? null,
-    blinds,
-    ante,
-    startTime,
-    notes
-  });
-  const message = buildRoundMessage(record);
-  const { notified, failures } = await notifyDealers(state.getDealers(), message);
-  res.json({ round: record, notified, failures });
-});
+app.post('/api/rounds', handleRoundRequest);
+app.post('/round', handleRoundRequest);
 
 app.post('/api/rebuys', async (req, res) => {
   const { table, player, amount, notes } = req.body;

@@ -131,8 +131,75 @@ function TournamentManager() {
   function handlePrevLevel() {
     setLevelIndex((i) => Math.max(0, i - 1));
   }
+  function postRoundUpdate(level, index) {
+    if (!level) {
+      return;
+    }
+
+    const isBreak = Boolean(level.break);
+    const roundLabel = isBreak ? "Break" : level.name ?? index + 1;
+    const parsedRoundNumber =
+      isBreak
+        ? null
+        : typeof roundLabel === "number"
+        ? roundLabel
+        : Number.isFinite(Number(roundLabel))
+        ? Number(roundLabel)
+        : index + 1;
+    const payload = {
+      round: roundLabel,
+      roundNumber: parsedRoundNumber,
+      name: typeof roundLabel === "string" ? roundLabel : null,
+      sb: level.sb ?? null,
+      bb: level.bb ?? null,
+      ante: level.ante ?? null,
+      break: isBreak,
+      durationMinutes:
+        typeof level.durationMs === "number" && !Number.isNaN(level.durationMs)
+          ? Math.round(level.durationMs / 60000)
+          : null,
+    };
+
+    if (!isBreak && payload.name === null && typeof payload.round === "number") {
+      payload.name = `Level ${payload.round}`;
+    }
+
+    if (!isBreak && payload.roundNumber === null) {
+      payload.roundNumber = index + 1;
+    }
+
+    fetch("/round", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          let message = `Round update failed with status ${response.status}`;
+          try {
+            const data = await response.json();
+            if (data && data.error) {
+              message = data.error;
+            }
+          } catch (error) {
+            // Ignore JSON parsing errors and fall back to the default message.
+          }
+          throw new Error(message);
+        }
+      })
+      .catch((error) => {
+        console.error("Failed to announce round", error);
+      });
+  }
   function handleNextLevel() {
-    setLevelIndex((i) => Math.min(levels.length - 1, i + 1));
+    setLevelIndex((i) => {
+      const nextIndex = Math.min(levels.length - 1, i + 1);
+      if (nextIndex !== i) {
+        const upcomingLevel = levels[nextIndex];
+        postRoundUpdate(upcomingLevel, nextIndex);
+      }
+      return nextIndex;
+    });
   }
   function resetLevelTimer() {
     setRemainingMs(curLevel.durationMs);
