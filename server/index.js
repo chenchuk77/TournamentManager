@@ -1,1233 +1,655 @@
 const fs = require('fs');
 const path = require('path');
-const express = require('express');
+const yaml = require('js-yaml');
 const { Telegraf, Markup } = require('telegraf');
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN;
+const CONFIG = loadConfig();
+const BOT_TOKEN =
+  process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || CONFIG.bot_token || CONFIG.token;
+
 if (!BOT_TOKEN) {
-  throw new Error('Missing TELEGRAM_BOT_TOKEN/BOT_TOKEN environment variable.');
+  throw new Error('Missing Telegram bot token. Set TELEGRAM_BOT_TOKEN/BOT_TOKEN or add bot_token to appconfig.');
 }
 
-const PORT = Number.parseInt(process.env.PORT || '3000', 10);
-const PERSIST_PATH = process.env.TOURNAMENT_STATE_FILE || path.join(__dirname, 'tournament-state.json');
-
-function normalizeTableValue(table) {
-  return String(table ?? '').trim();
-}
-
-const DEFAULT_TABLES = Array.from({ length: 10 }, (_, index) => String(index + 1));
-const TABLE_CHOICES = (() => {
-  const configured = (process.env.TOURNAMENT_TABLES || '')
-    .split(',')
-    .map(normalizeTableValue)
-    .filter(Boolean);
-  const base = configured.length > 0 ? configured : DEFAULT_TABLES;
-  return Array.from(new Set(base.map(normalizeTableValue)));
-})();
-const TABLE_CHOICES_SET = new Set(TABLE_CHOICES);
-const TABLE_CALLBACK_PREFIX = 'assign_table:';
-const ROUND_ACK_CALLBACK_PREFIX = 'round_ack:';
-const MAX_TRACKED_ROUNDS = 50;
-const DEALER_ACTION_CALLBACK_PREFIX = 'dealer_action:';
-const DEALER_ACTION_REBUY = 'rebuy';
-const DEALER_ACTION_ELIMINATION = 'elimination';
-const DEALER_ACTION_RECENT = 'recent';
-const DEALER_ACTIONS = [
-  { key: DEALER_ACTION_REBUY, label: '♻️ Rebuy' },
-  { key: DEALER_ACTION_ELIMINATION, label: '❌ Eliminate Player' },
-  { key: DEALER_ACTION_RECENT, label: '🗒 Recent activity' }
-];
-const STATIC_ROOT = process.env.STATIC_ROOT || path.join(__dirname, '..');
-
-const TELEGRAM_ALLOWED_USER_IDS = (() => {
-  const raw =
-    process.env.TELEGRAM_ALLOWED_USER_IDS || process.env.ALLOWED_TELEGRAM_IDS || '';
-  return new Set(
-    raw
-      .split(',')
-      .map((value) => value.trim())
-      .filter(Boolean)
-  );
-})();
-
-const UNAUTHORIZED_MESSAGE =
-  process.env.TELEGRAM_UNAUTHORIZED_MESSAGE ||
-  'You are not authorized to use this tournament bot. Please contact the tournament director.';
-
-function isDealerIdAllowed(id) {
-  if (!id) {
-    return false;
-  }
-  if (TELEGRAM_ALLOWED_USER_IDS.size === 0) {
-    return true;
-  }
-  return TELEGRAM_ALLOWED_USER_IDS.has(String(id));
-}
-
-function generateRoundId() {
-  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
-}
-
-const recentRounds = new Map();
-const pendingDealerActions = new Map();
-
-function rememberRound(record) {
-  recentRounds.set(record.id, {
-    label: computeRoundLabel(record)
-  });
-  if (recentRounds.size > MAX_TRACKED_ROUNDS) {
-    const oldestKey = recentRounds.keys().next().value;
-    if (oldestKey) {
-      recentRounds.delete(oldestKey);
-    }
-  }
-}
-
-function getTrackedRoundSummary(id) {
-  return recentRounds.get(id);
-}
-
-class TournamentState {
-  constructor(persistPath) {
-    this.persistPath = persistPath;
-    this.state = {
-      dealers: {},
-      currentRound: null,
-      rebuys: [],
-      eliminations: []
-    };
-    this.load();
-  }
-
-  load() {
-    if (!this.persistPath) {
-      return;
-    }
-
-    try {
-      if (fs.existsSync(this.persistPath)) {
-        const raw = JSON.parse(fs.readFileSync(this.persistPath, 'utf-8'));
-        this.state = {
-          dealers: raw.dealers || {},
-          currentRound: raw.currentRound || null,
-          rebuys: Array.isArray(raw.rebuys) ? raw.rebuys : [],
-          eliminations: Array.isArray(raw.eliminations) ? raw.eliminations : []
-        };
-      }
-    } catch (error) {
-      console.error('Failed to load persisted state:', error);
-    }
-  }
-
-  save() {
-    if (!this.persistPath) {
-      return;
-    }
-
-    try {
-      fs.mkdirSync(path.dirname(this.persistPath), { recursive: true });
-      fs.writeFileSync(this.persistPath, JSON.stringify(this.state, null, 2));
-    } catch (error) {
-      console.error('Failed to persist state:', error);
-    }
-  }
-
-  getDealers() {
-    return Object.values(this.state.dealers);
-  }
-
-  assignDealer(dealer) {
-    const now = new Date().toISOString();
-    const id = String(dealer.id);
-    const normalizedTable = dealer.table !== undefined ? String(dealer.table).trim() : undefined;
-    const existing = this.state.dealers[id];
-    const record = {
-      id,
-      chatId: dealer.chatId ? String(dealer.chatId) : id,
-      table: normalizedTable,
-      firstName: dealer.firstName || null,
-      lastName: dealer.lastName || null,
-      username: dealer.username || null,
-      createdAt: existing ? existing.createdAt : now,
-      updatedAt: now
-    };
-    this.state.dealers[id] = record;
-    this.save();
-    return record;
-  }
-
-  unassignDealer(id) {
-    const key = String(id);
-    const existing = this.state.dealers[key];
-    if (existing) {
-      delete this.state.dealers[key];
-      this.save();
-    }
-    return existing;
-  }
-
-  findDealerByTable(table) {
-    if (table === undefined || table === null) {
-      return undefined;
-    }
-    const normalized = String(table).trim().toLowerCase();
-    return this.getDealers().find((dealer) => {
-      if (dealer.table === undefined || dealer.table === null) {
-        return false;
-      }
-      return String(dealer.table).trim().toLowerCase() === normalized;
-    });
-  }
-
-  recordRoundChange(payload) {
-    const data = payload || {};
-    const record = {
-      ...data,
-      id: data.id ?? generateRoundId(),
-      tables: Array.isArray(data.tables) ? data.tables : [],
-      updatedAt: new Date().toISOString()
-    };
-    this.state.currentRound = record;
-    this.save();
-    return record;
-  }
-
-  recordRebuy(payload) {
-    const record = {
-      ...payload,
-      createdAt: new Date().toISOString()
-    };
-    this.state.rebuys.push(record);
-    this.save();
-    return record;
-  }
-
-  recordElimination(payload) {
-    const record = {
-      ...payload,
-      createdAt: new Date().toISOString()
-    };
-    this.state.eliminations.push(record);
-    this.save();
-    return record;
-  }
-
-  getState() {
-    return {
-      dealers: this.getDealers(),
-      currentRound: this.state.currentRound,
-      rebuys: this.state.rebuys,
-      eliminations: this.state.eliminations
-    };
-  }
-}
-
-const state = new TournamentState(PERSIST_PATH);
 const bot = new Telegraf(BOT_TOKEN);
+const chatStates = new Map();
 
-bot.use(async (ctx, next) => {
-  const telegramId = ctx.from?.id;
-  if (isDealerIdAllowed(telegramId)) {
-    return next();
+const ACTION_REBUY = 'action:rebuy';
+const ACTION_ELIMINATE = 'action:eliminate';
+const ACTION_RESET_ROUND = 'action:reset_round';
+const ACTION_SKIP_ROUND = 'action:skip_round';
+const CALLBACK_REBUY_PREFIX = 'rebuy_player:';
+const CALLBACK_ELIMINATE_PREFIX = 'eliminate_player:';
+
+bot.start(async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    return;
   }
 
-  const identifier = telegramId ? String(telegramId) : 'unknown';
-  const denialMessage = `${UNAUTHORIZED_MESSAGE} Your Telegram ID is ${identifier}.`;
+  const state = createInitialState(CONFIG);
+  chatStates.set(chatId, state);
 
-  if (ctx.updateType === 'callback_query') {
-    try {
-      await ctx.answerCbQuery('Not authorized', { show_alert: true });
-    } catch (error) {
-      console.warn('Failed to answer callback query for unauthorized user %s:', identifier, error);
-    }
-  }
+  await ctx.replyWithHTML(formatTournamentSummary(state));
+  await ctx.replyWithHTML(formatSeatAssignments(state));
+  await ctx.replyWithHTML(formatStructure(state));
 
-  if (typeof ctx.reply === 'function' && ctx.chat) {
-    try {
-      await ctx.reply(denialMessage);
-    } catch (error) {
-      console.warn('Failed to notify unauthorized user %s:', identifier, error);
-    }
-  }
-
-  console.warn('Blocked unauthorized Telegram user %s from accessing the bot.', identifier);
+  await startLevel(bot, chatId, state, 0, 'initial');
 });
 
-function dealerDisplayName(dealer) {
-  if (dealer.firstName || dealer.lastName) {
-    return [dealer.firstName, dealer.lastName].filter(Boolean).join(' ');
-  }
-  if (dealer.username) {
-    return `@${dealer.username}`;
-  }
-  return dealer.id;
-}
-
-async function notifyDealers(dealers, message, extra = {}) {
-  if (!Array.isArray(dealers) || dealers.length === 0) {
-    return { notified: [], failures: [] };
+bot.action(ACTION_REBUY, async (ctx) => {
+  const state = chatStates.get(ctx.chat?.id);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
   }
 
-  const results = await Promise.allSettled(
-    dealers.map((dealer) => bot.telegram.sendMessage(dealer.chatId, message, extra))
-  );
+  await ctx.answerCbQuery();
+  const keyboard = buildPlayerKeyboard(state, CALLBACK_REBUY_PREFIX, () => true);
+  if (!keyboard) {
+    await ctx.reply('No players available for a rebuy right now.');
+    return;
+  }
 
-  const notified = [];
-  const failures = [];
-  results.forEach((result, index) => {
-    const dealer = dealers[index];
-    if (result.status === 'fulfilled') {
-      notified.push(dealer.id);
-    } else {
-      failures.push({ dealer: dealer.id, error: result.reason.message || String(result.reason) });
-      console.error('Failed to notify dealer %s (%s): %s', dealer.id, dealerDisplayName(dealer), result.reason);
-    }
+  await ctx.reply('Select a player for the rebuy:', keyboard);
+});
+
+bot.action(ACTION_ELIMINATE, async (ctx) => {
+  const state = chatStates.get(ctx.chat?.id);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  const keyboard = buildPlayerKeyboard(state, CALLBACK_ELIMINATE_PREFIX, (player) => {
+    const info = state.playerStatus.get(player);
+    return info && !info.eliminated;
   });
 
-  return { notified, failures };
-}
-
-function toOptionalString(value) {
-  if (value === undefined || value === null) {
-    return null;
+  if (!keyboard) {
+    await ctx.reply('All players are already marked as eliminated.');
+    return;
   }
-  const result = String(value).trim();
-  return result.length > 0 ? result : null;
-}
 
-function toOptionalNumber(value) {
-  if (value === undefined || value === null || value === '') {
-    return null;
+  await ctx.reply('Select a player to eliminate:', keyboard);
+});
+
+bot.action(ACTION_RESET_ROUND, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    return;
   }
-  const numberValue = Number(value);
-  return Number.isNaN(numberValue) ? null : numberValue;
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+  await ctx.answerCbQuery('Current level restarted.');
+  await restartCurrentLevel(bot, chatId, state);
+});
+
+bot.action(ACTION_SKIP_ROUND, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    return;
+  }
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  const nextLevelIndex = state.currentLevelIndex + 1;
+  if (nextLevelIndex >= state.levels.length) {
+    await ctx.answerCbQuery('No more levels to skip to.');
+    return;
+  }
+
+  await ctx.answerCbQuery('Moving to the next level.');
+  await startLevel(bot, chatId, state, nextLevelIndex, 'skip');
+});
+
+bot.action(new RegExp(`^${escapeRegExp(CALLBACK_REBUY_PREFIX)}(.+)$`), async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  const player = decodeURIComponent(ctx.match[1]);
+  const info = state.playerStatus.get(player);
+  if (!info) {
+    await ctx.answerCbQuery('Unknown player.');
+    return;
+  }
+
+  info.rebuys += 1;
+  state.totalRebuys += 1;
+  state.rebuyHistory.push({ player, timestamp: new Date().toISOString() });
+
+  await ctx.answerCbQuery(`${player} recorded for a rebuy.`);
+  await safeEditMessageText(ctx, `Rebuy recorded for ${player}.`);
+  await updateMetricsMessage(bot, chatId, state);
+});
+
+bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ELIMINATE_PREFIX)}(.+)$`), async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  const player = decodeURIComponent(ctx.match[1]);
+  const info = state.playerStatus.get(player);
+  if (!info) {
+    await ctx.answerCbQuery('Unknown player.');
+    return;
+  }
+
+  if (info.eliminated) {
+    await ctx.answerCbQuery(`${player} is already eliminated.`);
+    return;
+  }
+
+  info.eliminated = true;
+  state.eliminationHistory.push({ player, timestamp: new Date().toISOString() });
+
+  await ctx.answerCbQuery(`${player} eliminated.`);
+  await safeEditMessageText(ctx, `${player} marked as eliminated.`);
+  await updateMetricsMessage(bot, chatId, state);
+});
+
+bot.launch();
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+function createInitialState(config) {
+  const players = getPlayers(config);
+  const dealers = getDealers(config, players);
+  const numberOfTables = getNumber(config.number_of_tables || config.numberOfTables || config.tables) || 1;
+  const seatAssignments = assignSeats(players, dealers, numberOfTables);
+  const playerStatus = new Map();
+  players.forEach((player) => {
+    playerStatus.set(player, { rebuys: 0, eliminated: false });
+  });
+
+  return {
+    config,
+    players,
+    dealers,
+    numberOfTables,
+    seatAssignments,
+    playerStatus,
+    rebuyHistory: [],
+    eliminationHistory: [],
+    totalRebuys: 0,
+    levels: Array.isArray(config.structure) ? config.structure : [],
+    currentLevelIndex: 0,
+    levelStartTime: null,
+    levelTimers: {
+      warning: null,
+      end: null
+    },
+    metricsMessageId: null
+  };
 }
 
-function normalizeTables(tables) {
-  if (!Array.isArray(tables)) {
+function getPlayers(config) {
+  const raw = config.players || config.player || [];
+  if (!Array.isArray(raw)) {
     return [];
   }
-  const normalized = tables
-    .map((table) => normalizeTableValue(table))
-    .filter(Boolean);
-  return Array.from(new Set(normalized));
-}
-
-function selectDealersForTables(tables) {
-  const normalized = Array.isArray(tables) ? tables : [];
-  if (normalized.length === 0) {
-    return state.getDealers();
-  }
-  const tableSet = new Set(normalized.map((table) => table.toLowerCase()));
-  return state.getDealers().filter((dealer) => {
-    if (!dealer.table) {
-      return false;
+  const unique = new Set();
+  raw.forEach((entry) => {
+    const name = String(entry || '').trim();
+    if (name) {
+      unique.add(name);
     }
-    return tableSet.has(normalizeTableValue(dealer.table).toLowerCase());
   });
+  return Array.from(unique);
 }
 
-function resolveDurationMinutes(payload) {
-  const explicit = toOptionalNumber(payload.durationMinutes);
-  if (explicit !== null) {
-    return explicit;
+function getDealers(config, players) {
+  const playerSet = new Set(players);
+  const raw = config.dealers || config.dealer || [];
+  if (!Array.isArray(raw)) {
+    return [];
   }
-  if (payload.durationMs !== undefined && payload.durationMs !== null && payload.durationMs !== '') {
-    const durationMs = Number(payload.durationMs);
-    if (!Number.isNaN(durationMs) && Number.isFinite(durationMs)) {
-      return Math.round(durationMs / 60000);
+  const dealers = raw
+    .map((entry) => String(entry || '').trim())
+    .filter((name) => name && playerSet.has(name));
+  return Array.from(new Set(dealers));
+}
+
+function assignSeats(players, dealers, numberOfTables) {
+  const tableCount = Math.max(1, Number.isFinite(numberOfTables) ? numberOfTables : 1);
+  const seatAssignments = [];
+  const dealerQueue = shuffle([...dealers]);
+  const seatPool = shuffle([...players]);
+
+  const removeFromSeatPool = (player) => {
+    const index = seatPool.indexOf(player);
+    if (index >= 0) {
+      seatPool.splice(index, 1);
     }
+  };
+
+  for (let tableIndex = 0; tableIndex < tableCount; tableIndex += 1) {
+    const seats = new Array(10).fill(null);
+
+    let dealer = dealerQueue.shift();
+    if (dealer) {
+      removeFromSeatPool(dealer);
+    } else if (seatPool.length > 0) {
+      dealer = seatPool.shift();
+    }
+    seats[1] = dealer || null;
+
+    for (let seat = 2; seat <= 9; seat += 1) {
+      if (seatPool.length === 0) {
+        seats[seat] = null;
+      } else {
+        seats[seat] = seatPool.shift();
+      }
+    }
+
+    seatAssignments.push(seats);
   }
-  return null;
+
+  return seatAssignments;
 }
 
-function prepareRoundRecord(body = {}) {
-  const roundCandidate = body.round ?? body.roundNumber ?? body.name;
-  const roundLabel = toOptionalString(roundCandidate);
-  if (!roundLabel) {
-    const error = new Error('A round identifier (round, roundNumber, or name) is required.');
-    error.status = 400;
-    throw error;
+function formatTournamentSummary(state) {
+  const playersList = state.players.map((player) => `• ${escapeHtml(player)}`).join('\n');
+  const dealerList = state.dealers.length
+    ? state.dealers.map((dealer) => escapeHtml(dealer)).join(', ')
+    : 'None';
+  const lines = [
+    '<b>Tournament Configuration</b>',
+    '',
+    `<b>Players (${state.players.length})</b>`,
+    playersList || 'No players configured.',
+    '',
+    `<b>Dealers</b>: ${dealerList}`,
+    `<b>Tables</b>: ${state.numberOfTables}`
+  ];
+  return lines.join('\n');
+}
+
+function formatSeatAssignments(state) {
+  const lines = ['<b>Seat Draw</b>', ''];
+  state.seatAssignments.forEach((tableSeats, index) => {
+    lines.push(`<b>Table ${index + 1}</b>`);
+    for (let seat = 1; seat <= 9; seat += 1) {
+      const label = seat === 1 ? 'Seat 1 (Dealer)' : `Seat ${seat}`;
+      const player = tableSeats[seat] ? escapeHtml(tableSeats[seat]) : '—';
+      lines.push(`${label}: ${player}`);
+    }
+    if (index < state.seatAssignments.length - 1) {
+      lines.push('');
+    }
+  });
+  return lines.join('\n');
+}
+
+function formatStructure(state) {
+  const levels = state.levels;
+  if (!levels.length) {
+    return '<b>Structure</b>\nNo blind levels configured.';
   }
 
-  const roundNumberValue = toOptionalNumber(
-    body.roundNumber ?? (roundCandidate !== undefined ? roundCandidate : undefined)
+  const lines = ['<b>Blind Structure</b>', ''];
+  levels.forEach((level, index) => {
+    lines.push(escapeHtml(formatLevelLabel(level, index)));
+  });
+  return lines.join('\n');
+}
+
+function formatMetrics(state) {
+  const lines = ['<b>Tournament Metrics</b>', ''];
+
+  const baseChips = getNumber(state.config?.buy_in?.chips);
+  const rebuyChips = getNumber(state.config?.rebuy?.chips);
+  const totalBaseChips = Number.isFinite(baseChips) ? baseChips * state.players.length : null;
+  const totalRebuyChips = Number.isFinite(rebuyChips) ? rebuyChips * state.totalRebuys : 0;
+  if (totalBaseChips !== null || totalRebuyChips > 0) {
+    const totalChips = (totalBaseChips ?? 0) + totalRebuyChips;
+    lines.push(`Total chips in play: <b>${formatNumber(totalChips)}</b>`);
+  }
+
+  const baseAmount = getNumber(state.config?.buy_in?.amount);
+  const rebuyAmount = getNumber(state.config?.rebuy?.amount);
+  const currency = state.config?.buy_in?.currency || state.config?.rebuy?.currency || '';
+  const totalBasePrize = Number.isFinite(baseAmount) ? baseAmount * state.players.length : null;
+  const totalRebuyPrize = Number.isFinite(rebuyAmount) ? rebuyAmount * state.totalRebuys : 0;
+  if (totalBasePrize !== null || totalRebuyPrize > 0) {
+    const totalPrize = (totalBasePrize ?? 0) + totalRebuyPrize;
+    lines.push(`Prize pool: <b>${escapeHtml(formatAmount(totalPrize, currency))}</b>`);
+  }
+
+  const activePlayers = Array.from(state.playerStatus.values()).filter((info) => !info.eliminated)
+    .length;
+  lines.push(`Active players: <b>${activePlayers}</b>`);
+
+  const eliminatedPlayers = Array.from(state.playerStatus.entries())
+    .filter(([, info]) => info.eliminated)
+    .map(([player]) => escapeHtml(player));
+  lines.push(
+    `Eliminated players: ${eliminatedPlayers.length ? eliminatedPlayers.join(', ') : 'None'}`
   );
 
-  const nameValue = toOptionalString(body.name);
-  const smallBlindValue = toOptionalString(body.sb ?? body.smallBlind);
-  const bigBlindValue = toOptionalString(body.bb ?? body.bigBlind);
-  const anteValue = toOptionalString(body.ante ?? body.anteAmount);
-  const startTimeValue = toOptionalString(body.startTime);
-  const notesValue = toOptionalString(body.notes);
-  const isBreak = Boolean(body.break || body.isBreak);
-  const durationMinutes = resolveDurationMinutes(body);
+  lines.push(`Rebuys logged: <b>${state.totalRebuys}</b>`);
 
-  const resolvedBlinds =
-    toOptionalString(body.blinds) ||
-    (smallBlindValue && bigBlindValue ? `${smallBlindValue}/${bigBlindValue}` : null);
-
-  const tables = normalizeTables(body.tables);
-
-  return {
-    record: {
-      round: roundLabel,
-      roundNumber: roundNumberValue,
-      name: nameValue,
-      blinds: resolvedBlinds,
-      smallBlind: smallBlindValue,
-      bigBlind: bigBlindValue,
-      ante: anteValue,
-      startTime: startTimeValue,
-      notes: notesValue,
-      isBreak,
-      durationMinutes,
-      tables
-    },
-    targetTables: tables
-  };
-}
-
-async function announceRoundUpdate(body = {}) {
-  const { record, targetTables } = prepareRoundRecord(body);
-  const storedRecord = state.recordRoundChange(record);
-  rememberRound(storedRecord);
-  const targetDealers = selectDealersForTables(targetTables);
-  const ackCallbackData = `${ROUND_ACK_CALLBACK_PREFIX}${storedRecord.id}`;
-  const ackMarkup = {
-    reply_markup: {
-      inline_keyboard: [[{ text: '✅ Acknowledge', callback_data: ackCallbackData }]]
+  const level = state.levels[state.currentLevelIndex];
+  if (level) {
+    lines.push(`Current level: ${escapeHtml(formatLevelLabel(level, state.currentLevelIndex))}`);
+    const remaining = formatTimeRemaining(state, level);
+    if (remaining) {
+      lines.push(`Time remaining: ${remaining}`);
     }
-  };
-  const message = buildRoundMessage(storedRecord);
-  const { notified, failures } = await notifyDealers(targetDealers, message, ackMarkup);
-  return {
-    round: storedRecord,
-    notified,
-    failures,
-    dealers: targetDealers.map((dealer) => dealer.id),
-    tables: storedRecord.tables
-  };
-}
-
-async function handleRoundRequest(req, res) {
-  try {
-    const result = await announceRoundUpdate(req.body || {});
-    res.json(result);
-  } catch (error) {
-    const status = Number.isInteger(error.status) ? error.status : 500;
-    if (status >= 500) {
-      console.error('Failed to process round update:', error);
+    const nextLevel = state.levels[state.currentLevelIndex + 1];
+    if (nextLevel) {
+      lines.push(`Next level: ${escapeHtml(formatLevelLabel(nextLevel, state.currentLevelIndex + 1))}`);
     }
-    res.status(status).json({ error: error.message || 'Failed to process round update.' });
-  }
-}
-
-function buildTableKeyboard(currentDealerId) {
-  const assignments = new Map();
-  state.getDealers().forEach((dealer) => {
-    if (!dealer.table) {
-      return;
-    }
-    assignments.set(normalizeTableValue(dealer.table), dealer);
-  });
-
-  const buttons = TABLE_CHOICES.map((table) => {
-    const normalized = normalizeTableValue(table);
-    const occupant = assignments.get(normalized);
-    let label = `Table ${normalized}`;
-    if (occupant) {
-      label += occupant.id === String(currentDealerId) ? ' (you)' : ' (taken)';
-    }
-    return Markup.button.callback(label, `${TABLE_CALLBACK_PREFIX}${normalized}`);
-  });
-
-  return Markup.inlineKeyboard(buttons, { columns: 3 });
-}
-
-function computeRoundLabel(round) {
-  if (round.isBreak) {
-    return 'Break';
-  }
-  const base = round.round ?? round.roundNumber ?? round.name;
-  const label = toOptionalString(base);
-  return label ? `Round ${label}` : 'Round update';
-}
-
-function buildRoundMessage(round) {
-  if (round.isBreak) {
-    const parts = [computeRoundLabel(round)];
-    if (Number.isFinite(round.durationMinutes) && round.durationMinutes !== null) {
-      const minutes = Number(round.durationMinutes);
-      if (!Number.isNaN(minutes)) {
-        const unit = minutes === 1 ? 'minute' : 'minutes';
-        parts.push(`${minutes} ${unit}`);
-      }
-    }
-    const header = parts.join(' — ');
-    const details = [];
-    if (round.notes) {
-      details.push(round.notes);
-    }
-    if (round.startTime) {
-      details.push(`Start time: ${round.startTime}`);
-    }
-    return details.length > 0 ? [header, ...details].join('\n') : header;
-  }
-
-  const headerParts = [];
-  headerParts.push(computeRoundLabel(round));
-  const blindsValue =
-    toOptionalString(round.blinds) ||
-    (toOptionalString(round.smallBlind) && toOptionalString(round.bigBlind)
-      ? `${toOptionalString(round.smallBlind)}/${toOptionalString(round.bigBlind)}`
-      : null);
-  if (blindsValue) {
-    headerParts.push(`Blinds ${blindsValue}`);
-  }
-  let message = headerParts.join(' — ');
-  const details = [];
-  if (round.ante) {
-    details.push(`Ante ${round.ante}`);
-  }
-  if (round.startTime) {
-    details.push(`Start time: ${round.startTime}`);
-  }
-  if (round.notes) {
-    details.push(round.notes);
-  }
-  if (details.length > 0) {
-    message = [message, ...details].join('\n');
-  }
-  return message;
-}
-
-function buildRebuyMessage(rebuy) {
-  const parts = [`\u267B\uFE0F Rebuy requested at table ${rebuy.table}`];
-  if (rebuy.player) {
-    parts.push(`Player: ${rebuy.player}`);
-  }
-  if (rebuy.amount) {
-    parts.push(`Amount: ${rebuy.amount}`);
-  }
-  if (rebuy.notes) {
-    parts.push(rebuy.notes);
-  }
-  return parts.join('\n');
-}
-
-function buildEliminationMessage(elimination) {
-  const parts = [`\u274C Player eliminated: ${elimination.player || 'Unknown'}`];
-  if (elimination.table) {
-    parts.push(`Table: ${elimination.table}`);
-  }
-  if (elimination.position) {
-    parts.push(`Position: ${elimination.position}`);
-  }
-  if (elimination.payout) {
-    parts.push(`Payout: ${elimination.payout}`);
-  }
-  if (elimination.notes) {
-    parts.push(elimination.notes);
-  }
-  return parts.join('\n');
-}
-
-function formatActivityTimestamp(timestamp) {
-  if (!timestamp) {
-    return null;
-  }
-  try {
-    const date = new Date(timestamp);
-    if (Number.isNaN(date.getTime())) {
-      return String(timestamp);
-    }
-    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  } catch (error) {
-    return String(timestamp);
-  }
-}
-
-function buildRecentActivitySummary(dealer) {
-  const dealerTable = dealer?.table ? normalizeTableValue(dealer.table) : null;
-  const rebuys = Array.isArray(state.state.rebuys) ? state.state.rebuys : [];
-  const eliminations = Array.isArray(state.state.eliminations) ? state.state.eliminations : [];
-
-  const matchesTable = (record) => {
-    if (!dealerTable) {
-      return true;
-    }
-    return normalizeTableValue(record.table) === dealerTable;
-  };
-
-  const recentRebuys = rebuys.filter(matchesTable).slice(-5).reverse();
-  const recentEliminations = eliminations.filter(matchesTable).slice(-5).reverse();
-
-  const lines = [];
-  if (dealerTable) {
-    lines.push(`Recent activity for table ${dealerTable}:`);
   } else {
-    lines.push('Recent tournament activity:');
-  }
-
-  if (recentRebuys.length === 0) {
-    lines.push('♻️ No rebuys recorded yet.');
-  } else {
-    lines.push('♻️ Rebuys');
-    recentRebuys.forEach((rebuy) => {
-      const details = [];
-      const timestamp = formatActivityTimestamp(rebuy.createdAt);
-      if (timestamp) {
-        details.push(timestamp);
-      }
-      if (!dealerTable && rebuy.table) {
-        details.push(`Table ${normalizeTableValue(rebuy.table)}`);
-      }
-      if (rebuy.player) {
-        details.push(rebuy.player);
-      }
-      if (rebuy.amount) {
-        details.push(`Amount ${rebuy.amount}`);
-      }
-      const line = details.length > 0 ? details.join(' — ') : 'Recorded';
-      lines.push(`• ${line}`);
-      if (rebuy.notes) {
-        lines.push(`    ${rebuy.notes}`);
-      }
-    });
-  }
-
-  if (recentEliminations.length === 0) {
-    lines.push('❌ No eliminations recorded yet.');
-  } else {
-    lines.push('❌ Eliminations');
-    recentEliminations.forEach((elimination) => {
-      const details = [];
-      const timestamp = formatActivityTimestamp(elimination.createdAt);
-      if (timestamp) {
-        details.push(timestamp);
-      }
-      if (!dealerTable && elimination.table) {
-        details.push(`Table ${normalizeTableValue(elimination.table)}`);
-      }
-      if (elimination.player) {
-        details.push(elimination.player);
-      }
-      if (elimination.position) {
-        details.push(`#${elimination.position}`);
-      }
-      if (elimination.payout) {
-        details.push(`Payout ${elimination.payout}`);
-      }
-      const line = details.length > 0 ? details.join(' — ') : 'Recorded';
-      lines.push(`• ${line}`);
-      if (elimination.notes) {
-        lines.push(`    ${elimination.notes}`);
-      }
-    });
+    lines.push('Structure complete.');
   }
 
   return lines.join('\n');
 }
 
-function setPendingDealerAction(telegramId, payload) {
-  if (telegramId === undefined || telegramId === null) {
-    return;
+function formatTimeRemaining(state, level) {
+  const durationMinutes = getLevelDurationMinutes(level);
+  if (!durationMinutes || !state.levelStartTime) {
+    return null;
   }
-  pendingDealerActions.set(String(telegramId), payload);
+  const durationMs = durationMinutes * 60 * 1000;
+  const elapsed = Date.now() - state.levelStartTime.getTime();
+  const remaining = Math.max(0, durationMs - elapsed);
+  return formatDuration(remaining);
 }
 
-function getPendingDealerAction(telegramId) {
-  if (telegramId === undefined || telegramId === null) {
-    return undefined;
-  }
-  return pendingDealerActions.get(String(telegramId));
-}
+function updateMetricsMessage(botInstance, chatId, state) {
+  const text = formatMetrics(state);
+  const keyboard = getMetricsKeyboard();
 
-function clearPendingDealerAction(telegramId) {
-  if (telegramId === undefined || telegramId === null) {
-    return;
-  }
-  pendingDealerActions.delete(String(telegramId));
-}
+  if (state.metricsMessageId) {
+    return botInstance.telegram
+      .editMessageText(chatId, state.metricsMessageId, undefined, text, {
+        parse_mode: 'HTML',
+        ...keyboard
+      })
+      .catch((error) => {
+        const errorCode =
+          error?.on?.payload?.error_code || error?.code || error?.response?.error_code;
+        const description =
+          error?.on?.payload?.description || error?.description || error?.response?.description || '';
 
-function buildDealerActionKeyboard() {
-  const buttons = DEALER_ACTIONS.map((action) =>
-    Markup.button.callback(action.label, `${DEALER_ACTION_CALLBACK_PREFIX}${action.key}`)
-  );
-  return Markup.inlineKeyboard(buttons, { columns: 1 });
-}
+        if (description.includes('message is not modified')) {
+          return null;
+        }
 
-function sendDealerActionMenu(ctx, text = 'Dealer actions') {
-  return ctx.reply(text, buildDealerActionKeyboard());
-}
+        if (errorCode === 400 || errorCode === 403 || description.includes('message to edit')) {
+          return sendMetricsMessage(botInstance, chatId, state, text, keyboard);
+        }
 
-function getDealerByTelegramId(id) {
-  if (id === undefined || id === null) {
-    return undefined;
-  }
-  const identifier = String(id);
-  return state.getDealers().find((dealer) => dealer.id === identifier);
-}
-
-function splitInputLines(text) {
-  if (text === undefined || text === null) {
-    return [];
-  }
-  return String(text)
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-}
-
-function parseRebuyInput(text) {
-  const lines = splitInputLines(text);
-  if (lines.length === 0) {
-    return { player: null, amount: null, notes: null };
-  }
-
-  const player = toOptionalString(lines.shift());
-  let amount = null;
-  if (lines.length > 0) {
-    const amountCandidate = lines[0];
-    if (/^\$?\d+(?:[.,]\d{1,2})?$/.test(amountCandidate)) {
-      amount = lines.shift();
-    }
-  }
-  const notes = lines.length > 0 ? lines.join('\n') : null;
-  return { player, amount: toOptionalString(amount), notes: toOptionalString(notes) };
-}
-
-function parseEliminationInput(text) {
-  const lines = splitInputLines(text);
-  if (lines.length === 0) {
-    return { player: null, position: null, payout: null, notes: null };
-  }
-
-  const player = toOptionalString(lines.shift());
-  let table = null;
-  for (let index = 0; index < lines.length; index += 1) {
-    const tableMatch = lines[index].match(/^t(?:able)?\s*#?\s*:?\s*(.+)$/i);
-    if (tableMatch) {
-      table = normalizeTableValue(tableMatch[1]);
-      lines.splice(index, 1);
-      break;
-    }
-  }
-  let position = null;
-  if (lines.length > 0) {
-    const positionCandidate = lines[0];
-    if (/^#?\d+(?:st|nd|rd|th)?$/i.test(positionCandidate)) {
-      position = positionCandidate.replace(/^#/, '');
-      lines.shift();
-    }
-  }
-
-  let payout = null;
-  if (lines.length > 0) {
-    const payoutCandidate = lines[0];
-    if (/^\$?\d+(?:[.,]\d{1,2})?$/.test(payoutCandidate)) {
-      payout = lines.shift();
-    }
-  }
-
-  const notes = lines.length > 0 ? lines.join('\n') : null;
-  return {
-    player,
-    table: toOptionalString(table),
-    position: toOptionalString(position),
-    payout: toOptionalString(payout),
-    notes: toOptionalString(notes)
-  };
-}
-
-async function submitRebuy(payload = {}) {
-  const normalizedTable = normalizeTableValue(payload.table);
-  if (!normalizedTable) {
-    const error = new Error('Table is required for a rebuy request.');
-    error.status = 400;
-    throw error;
-  }
-
-  const dealer = state.findDealerByTable(normalizedTable);
-  if (!dealer) {
-    const error = new Error(`No dealer is registered for table ${normalizedTable}.`);
-    error.status = 404;
-    throw error;
-  }
-
-  const record = state.recordRebuy({
-    table: dealer.table,
-    player: toOptionalString(payload.player),
-    amount: toOptionalString(payload.amount),
-    notes: toOptionalString(payload.notes)
-  });
-
-  const message = buildRebuyMessage(record);
-  const { notified, failures } = await notifyDealers([dealer], message);
-  return { record, dealer, message, notified, failures };
-}
-
-async function submitElimination(payload = {}) {
-  const player = toOptionalString(payload.player);
-  if (!player) {
-    const error = new Error('Player name is required for eliminations.');
-    error.status = 400;
-    throw error;
-  }
-
-  const record = state.recordElimination({
-    player,
-    table: toOptionalString(payload.table),
-    position: toOptionalString(payload.position),
-    payout: toOptionalString(payload.payout),
-    notes: toOptionalString(payload.notes)
-  });
-
-  const message = buildEliminationMessage(record);
-  const { notified, failures } = await notifyDealers(state.getDealers(), message);
-  return { record, message, notified, failures };
-}
-
-async function handleDealerActionSelection(ctx, actionKey) {
-  const telegramId = ctx.from?.id;
-  if (!telegramId) {
-    await ctx.answerCbQuery('Unable to determine your account.', { show_alert: true });
-    return;
-  }
-
-  const dealer = getDealerByTelegramId(telegramId);
-  const dealerId = String(telegramId);
-  const normalizedAction = String(actionKey || '').toLowerCase();
-
-  if (normalizedAction === DEALER_ACTION_REBUY) {
-    if (!dealer || !dealer.table) {
-      await ctx.answerCbQuery('Assign yourself to a table before requesting a rebuy.', {
-        show_alert: true
+        throw error;
       });
+  }
+
+  return sendMetricsMessage(botInstance, chatId, state, text, keyboard);
+}
+
+function sendMetricsMessage(botInstance, chatId, state, text, keyboard) {
+  return botInstance.telegram
+    .sendMessage(chatId, text, { parse_mode: 'HTML', ...keyboard })
+    .then((message) => {
+      state.metricsMessageId = message.message_id;
+      return message;
+    });
+}
+
+async function startLevel(botInstance, chatId, state, levelIndex, reason) {
+  clearLevelTimers(state);
+
+  if (levelIndex >= state.levels.length) {
+    state.currentLevelIndex = state.levels.length;
+    state.levelStartTime = null;
+    await botInstance.telegram.sendMessage(chatId, 'All blind levels completed.');
+    await updateMetricsMessage(botInstance, chatId, state);
+    return;
+  }
+
+  state.currentLevelIndex = levelIndex;
+  state.levelStartTime = new Date();
+
+  const level = state.levels[levelIndex];
+  const label = formatLevelLabel(level, levelIndex);
+  const prefix =
+    reason === 'skip'
+      ? 'Skipping to'
+      : reason === 'reset'
+      ? 'Restarting'
+      : reason === 'auto'
+      ? 'Starting'
+      : 'Starting';
+  await botInstance.telegram.sendMessage(chatId, `${prefix} ${label}`);
+
+  scheduleLevelTimers(botInstance, chatId, state, level, label);
+  await updateMetricsMessage(botInstance, chatId, state);
+}
+
+async function restartCurrentLevel(botInstance, chatId, state) {
+  if (!state.levels[state.currentLevelIndex]) {
+    await botInstance.telegram.sendMessage(chatId, 'No active level to restart.');
+    return;
+  }
+  await startLevel(botInstance, chatId, state, state.currentLevelIndex, 'reset');
+}
+
+function scheduleLevelTimers(botInstance, chatId, state, level, label) {
+  const durationMinutes = getLevelDurationMinutes(level);
+  if (!durationMinutes) {
+    return;
+  }
+  const durationMs = durationMinutes * 60 * 1000;
+
+  const warningDelay = durationMs - 60 * 1000;
+  if (warningDelay > 0) {
+    state.levelTimers.warning = setTimeout(() => {
+      botInstance.telegram
+        .sendMessage(chatId, `1 minute remaining in ${label}.`)
+        .catch((error) => console.error('Failed to send warning message', error));
+    }, warningDelay);
+  }
+
+  state.levelTimers.end = setTimeout(() => {
+    botInstance.telegram
+      .sendMessage(chatId, `${label} complete. Advancing to the next level.`)
+      .catch((error) => console.error('Failed to send level completion message', error));
+    startLevel(botInstance, chatId, state, state.currentLevelIndex + 1, 'auto').catch((error) =>
+      console.error('Failed to start the next level', error)
+    );
+  }, durationMs);
+}
+
+function clearLevelTimers(state) {
+  if (state.levelTimers.warning) {
+    clearTimeout(state.levelTimers.warning);
+    state.levelTimers.warning = null;
+  }
+  if (state.levelTimers.end) {
+    clearTimeout(state.levelTimers.end);
+    state.levelTimers.end = null;
+  }
+}
+
+function buildPlayerKeyboard(state, prefix, filterFn) {
+  const filtered = state.players.filter((player) => filterFn(player));
+  if (filtered.length === 0) {
+    return null;
+  }
+
+  const buttons = filtered.map((player) =>
+    Markup.button.callback(player, `${prefix}${encodeURIComponent(player)}`)
+  );
+
+  const rows = [];
+  for (let index = 0; index < buttons.length; index += 2) {
+    rows.push(buttons.slice(index, index + 2));
+  }
+  return Markup.inlineKeyboard(rows);
+}
+
+function getMetricsKeyboard() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback('♻️ Rebuy', ACTION_REBUY),
+      Markup.button.callback('❌ Eliminate Player', ACTION_ELIMINATE)
+    ],
+    [
+      Markup.button.callback('🔁 Reset Round', ACTION_RESET_ROUND),
+      Markup.button.callback('⏭️ Skip Round', ACTION_SKIP_ROUND)
+    ]
+  ]);
+}
+
+function formatLevelLabel(level, index) {
+  const levelNumber = level.level || level.level_number || level.number || index + 1;
+  const sb = getNumber(level.small_blind || level.smallBlind || level.sb);
+  const bb = getNumber(level.big_blind || level.bigBlind || level.bb);
+  const anteNumber = getNumber(level.ante);
+  const duration = getLevelDurationMinutes(level);
+
+  const parts = [`Level ${levelNumber}`];
+  if (Number.isFinite(sb) && Number.isFinite(bb)) {
+    parts.push(`${formatNumber(sb)}/${formatNumber(bb)}`);
+  }
+  if (Number.isFinite(anteNumber) && anteNumber > 0) {
+    parts.push(`Ante ${formatNumber(anteNumber)}`);
+  }
+  if (Number.isFinite(duration)) {
+    parts.push(`${duration}m`);
+  }
+
+  return parts.join(' – ');
+}
+
+function getLevelDurationMinutes(level) {
+  const candidates = [
+    level.duration_minutes,
+    level.durationMinutes,
+    level.duration,
+    level.minutes,
+    level.time_minutes,
+    level.timeMinutes
+  ];
+  for (const value of candidates) {
+    const number = getNumber(value);
+    if (Number.isFinite(number)) {
+      return number;
+    }
+  }
+  return null;
+}
+
+function formatNumber(value) {
+  return new Intl.NumberFormat('en-US').format(value);
+}
+
+function formatAmount(amount, currency) {
+  if (!Number.isFinite(amount)) {
+    return String(amount);
+  }
+  const formatted = new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2
+  }).format(amount);
+  if (!currency) {
+    return formatted;
+  }
+  return `${currency}${formatted}`;
+}
+
+function formatDuration(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
+function shuffle(items) {
+  const array = [...items];
+  for (let i = array.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
+}
+
+function getNumber(value) {
+  if (value === undefined || value === null || value === '') {
+    return NaN;
+  }
+  const number = Number(value);
+  return Number.isFinite(number) ? number : NaN;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function loadConfig() {
+  const candidates = ['appconfig.yaml', 'appconfig.yml', 'appconfig.json'];
+  for (const file of candidates) {
+    const resolved = path.resolve(__dirname, '..', file);
+    if (!fs.existsSync(resolved)) {
+      continue;
+    }
+
+    const raw = fs.readFileSync(resolved, 'utf8');
+    if (!raw.trim()) {
+      continue;
+    }
+
+    if (file.endsWith('.json')) {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    }
+    const parsed = yaml.load(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  }
+
+  throw new Error('No configuration file found. Create appconfig.yaml or appconfig.json at the project root.');
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function safeEditMessageText(ctx, text) {
+  try {
+    await ctx.editMessageText(text);
+  } catch (error) {
+    const errorCode = error?.on?.payload?.error_code || error?.code || error?.response?.error_code;
+    const description =
+      error?.on?.payload?.description || error?.description || error?.response?.description || '';
+
+    if (description.includes('message is not modified') || description.includes('message to edit')) {
       return;
     }
 
-    setPendingDealerAction(telegramId, {
-      type: DEALER_ACTION_REBUY,
-      dealerId,
-      table: dealer.table
-    });
-
-    await ctx.answerCbQuery();
-    const promptLines = [
-      `Enter the player name or seat for the rebuy at table ${dealer.table}.`,
-      'Include amount or notes on additional lines if needed.',
-      'Send /cancel to abort.'
-    ];
-    await ctx.reply(promptLines.join('\n'), Markup.forceReply());
-    return;
-  }
-
-  if (normalizedAction === DEALER_ACTION_ELIMINATION) {
-    setPendingDealerAction(telegramId, {
-      type: DEALER_ACTION_ELIMINATION,
-      dealerId,
-      table: dealer?.table ?? null
-    });
-
-    await ctx.answerCbQuery();
-    const promptLines = [];
-    if (dealer?.table) {
-      promptLines.push(`Enter the player name or seat for the elimination at table ${dealer.table}.`);
-    } else {
-      promptLines.push('Enter the player name or seat for the elimination.');
-      promptLines.push('Include the table number on a new line if needed.');
+    if (errorCode !== 400) {
+      throw error;
     }
-    promptLines.push('Include payout or notes on additional lines if needed.');
-    promptLines.push('Send /cancel to abort.');
-    await ctx.reply(promptLines.join('\n'), Markup.forceReply());
-    return;
-  }
-
-  if (normalizedAction === DEALER_ACTION_RECENT) {
-    await ctx.answerCbQuery();
-    const summary = buildRecentActivitySummary(dealer);
-    await ctx.reply(summary);
-    return;
-  }
-
-  await ctx.answerCbQuery('Unknown action.', { show_alert: true });
-}
-
-async function handleRebuyText(ctx, pending, text) {
-  const telegramId = ctx.from?.id;
-  const { player, amount, notes } = parseRebuyInput(text);
-
-  if (!player) {
-    await ctx.reply('Please provide a player name or seat for the rebuy.');
-    return false;
-  }
-
-  const table = pending?.table ?? getDealerByTelegramId(telegramId)?.table;
-  if (!table) {
-    clearPendingDealerAction(telegramId);
-    await ctx.reply('You are not assigned to a table. Use /start to choose your table before requesting a rebuy.');
-    return true;
-  }
-
-  try {
-    const result = await submitRebuy({ table, player, amount, notes });
-    clearPendingDealerAction(telegramId);
-
-    const confirmationLines = [`\u267B\uFE0F Rebuy recorded at table ${result.record.table}.`];
-    const effectivePlayer = result.record.player || player;
-    if (effectivePlayer) {
-      confirmationLines.push(`Player: ${effectivePlayer}`);
-    }
-    if (result.record.amount || amount) {
-      confirmationLines.push(`Amount: ${result.record.amount || amount}`);
-    }
-    if (result.record.notes || notes) {
-      confirmationLines.push(result.record.notes || notes);
-    }
-    if (result.failures.length === 0) {
-      confirmationLines.push('Notification sent to your table.');
-    } else {
-      confirmationLines.push('⚠️ Unable to deliver the automatic notification. Please confirm manually.');
-    }
-
-    await ctx.reply(confirmationLines.join('\n'));
-    await sendDealerActionMenu(ctx, 'Dealer actions');
-    return true;
-  } catch (error) {
-    clearPendingDealerAction(telegramId);
-    const message = error?.message || 'Failed to record rebuy.';
-    await ctx.reply(`Failed to record rebuy: ${message}`);
-    await sendDealerActionMenu(ctx, 'Dealer actions');
-    return true;
   }
 }
-
-async function handleEliminationText(ctx, pending, text) {
-  const telegramId = ctx.from?.id;
-  const parsed = parseEliminationInput(text);
-
-  if (!parsed.player) {
-    await ctx.reply('Please provide the player name or seat for the elimination.');
-    return false;
-  }
-
-  const dealer = getDealerByTelegramId(telegramId);
-  const table = parsed.table || pending?.table || dealer?.table || null;
-
-  try {
-    const result = await submitElimination({
-      player: parsed.player,
-      table,
-      position: parsed.position,
-      payout: parsed.payout,
-      notes: parsed.notes
-    });
-    clearPendingDealerAction(telegramId);
-
-    const confirmationLines = [`\u274C Elimination recorded for ${result.record.player}.`];
-    const effectiveTable = result.record.table || table;
-    if (effectiveTable) {
-      confirmationLines.push(`Table: ${effectiveTable}`);
-    }
-    if (result.record.position || parsed.position) {
-      confirmationLines.push(`Position: ${result.record.position || parsed.position}`);
-    }
-    if (result.record.payout || parsed.payout) {
-      confirmationLines.push(`Payout: ${result.record.payout || parsed.payout}`);
-    }
-    if (result.record.notes || parsed.notes) {
-      confirmationLines.push(result.record.notes || parsed.notes);
-    }
-    if (result.failures.length === 0) {
-      confirmationLines.push('Broadcast sent to all dealers.');
-    } else {
-      confirmationLines.push('⚠️ Some dealers did not receive the broadcast automatically.');
-    }
-
-    await ctx.reply(confirmationLines.join('\n'));
-    await sendDealerActionMenu(ctx, 'Dealer actions');
-    return true;
-  } catch (error) {
-    clearPendingDealerAction(telegramId);
-    const message = error?.message || 'Failed to record elimination.';
-    await ctx.reply(`Failed to record elimination: ${message}`);
-    await sendDealerActionMenu(ctx, 'Dealer actions');
-    return true;
-  }
-}
-
-bot.start(async (ctx) => {
-  const keyboard = buildTableKeyboard(ctx.from?.id);
-  await ctx.reply('Choose your table', keyboard);
-  await sendDealerActionMenu(ctx, 'Dealer actions');
-});
-
-bot.on('callback_query', async (ctx) => {
-  const data = ctx.callbackQuery?.data;
-  if (!data) {
-    await ctx.answerCbQuery();
-    return;
-  }
-
-  if (data.startsWith(ROUND_ACK_CALLBACK_PREFIX)) {
-    const ackId = data.slice(ROUND_ACK_CALLBACK_PREFIX.length);
-    const summary = getTrackedRoundSummary(ackId);
-    const acknowledgement = summary?.label ? `${summary.label} acknowledged.` : 'Acknowledged.';
-    await ctx.answerCbQuery(acknowledgement);
-    console.log(
-      'Dealer %s acknowledged %s',
-      ctx.from?.id ?? 'unknown',
-      summary?.label ?? `round update ${ackId}`
-    );
-    return;
-  }
-
-  if (data.startsWith(DEALER_ACTION_CALLBACK_PREFIX)) {
-    const actionKey = data.slice(DEALER_ACTION_CALLBACK_PREFIX.length);
-    await handleDealerActionSelection(ctx, actionKey);
-    return;
-  }
-
-  if (!data.startsWith(TABLE_CALLBACK_PREFIX)) {
-    await ctx.answerCbQuery();
-    return;
-  }
-
-  const selectedTable = normalizeTableValue(data.slice(TABLE_CALLBACK_PREFIX.length));
-  if (!selectedTable || !TABLE_CHOICES_SET.has(selectedTable)) {
-    await ctx.answerCbQuery('Unknown table selection.', { show_alert: true });
-    return;
-  }
-
-  const currentUserId = String(ctx.from?.id ?? '');
-  if (!currentUserId) {
-    await ctx.answerCbQuery('Unable to determine your account.', { show_alert: true });
-    return;
-  }
-
-  const existing = state.findDealerByTable(selectedTable);
-  if (existing && existing.id !== currentUserId) {
-    await ctx.answerCbQuery('That table is already taken.', { show_alert: true });
-    return;
-  }
-
-  const dealer = state.assignDealer({
-    id: ctx.from.id,
-    chatId: ctx.callbackQuery?.message?.chat?.id ?? ctx.from.id,
-    table: selectedTable,
-    firstName: ctx.from.first_name,
-    lastName: ctx.from.last_name,
-    username: ctx.from.username
-  });
-
-  await ctx.answerCbQuery(`Assigned to table ${selectedTable}`);
-
-  try {
-    await ctx.editMessageText(`Selected table: ${selectedTable}`);
-  } catch (error) {
-    console.warn('Failed to edit message after table selection:', error);
-  }
-
-  await ctx.reply(`You are now assigned to table ${dealer.table}.`);
-  await sendDealerActionMenu(ctx, 'Dealer actions');
-});
-
-bot.command(['menu', 'actions'], async (ctx) => {
-  await sendDealerActionMenu(ctx, 'Dealer actions');
-});
-
-bot.command('cancel', async (ctx) => {
-  const pending = getPendingDealerAction(ctx.from?.id);
-  if (pending) {
-    clearPendingDealerAction(ctx.from?.id);
-    await ctx.reply('Current action cancelled. Use /menu to choose another option.');
-  } else {
-    await ctx.reply('There is no pending action to cancel.');
-  }
-});
-
-bot.command('assign', async (ctx) => {
-  await ctx.reply('Please use /start to choose your table from the menu.');
-});
-
-bot.command('unassign', async (ctx) => {
-  const removed = state.unassignDealer(ctx.from.id);
-  if (removed) {
-    await ctx.reply('You have been unassigned from your table.');
-  } else {
-    await ctx.reply('No assignment was found for you.');
-  }
-});
-
-bot.command('table', async (ctx) => {
-  const dealer = state.getDealers().find((d) => d.id === String(ctx.from.id));
-  if (!dealer) {
-    await ctx.reply('You are not currently assigned to a table.');
-    return;
-  }
-  await ctx.reply(`You are assigned to table ${dealer.table}.`);
-});
-
-bot.command('status', async (ctx) => {
-  const dealer = state.getDealers().find((d) => d.id === String(ctx.from.id));
-  if (!dealer) {
-    await ctx.reply('You are not currently assigned to a table.');
-    return;
-  }
-  const round = state.state.currentRound;
-  if (round) {
-    await ctx.reply(buildRoundMessage(round));
-  } else {
-    await ctx.reply('The tournament round has not been announced yet.');
-  }
-});
-
-bot.command(['recent', 'history'], async (ctx) => {
-  const dealer = getDealerByTelegramId(ctx.from?.id);
-  await ctx.reply(buildRecentActivitySummary(dealer));
-});
-
-bot.on('text', async (ctx, next) => {
-  const telegramId = ctx.from?.id;
-  if (!telegramId) {
-    if (typeof next === 'function') {
-      await next();
-    }
-    return;
-  }
-
-  const pending = getPendingDealerAction(telegramId);
-  if (!pending) {
-    if (typeof next === 'function') {
-      await next();
-    }
-    return;
-  }
-
-  const text = ctx.message?.text ?? '';
-  const normalized = text.trim();
-  if (!normalized) {
-    await ctx.reply('Please provide a response or send /cancel to abort.');
-    return;
-  }
-
-  if (normalized.toLowerCase() === '/cancel') {
-    clearPendingDealerAction(telegramId);
-    await ctx.reply('Current action cancelled. Use /menu to choose another option.');
-    return;
-  }
-
-  if (normalized.startsWith('/')) {
-    if (typeof next === 'function') {
-      await next();
-    }
-    return;
-  }
-
-  if (pending.type === DEALER_ACTION_REBUY) {
-    const handled = await handleRebuyText(ctx, pending, text);
-    if (!handled && typeof next === 'function') {
-      await next();
-    }
-    return;
-  }
-
-  if (pending.type === DEALER_ACTION_ELIMINATION) {
-    const handled = await handleEliminationText(ctx, pending, text);
-    if (!handled && typeof next === 'function') {
-      await next();
-    }
-    return;
-  }
-
-  clearPendingDealerAction(telegramId);
-  if (typeof next === 'function') {
-    await next();
-  }
-});
-
-bot.launch().then(() => {
-  console.log('Telegram bot launched and ready.');
-});
-
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
-const app = express();
-app.use(express.json());
-
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', dealers: state.getDealers().length });
-});
-
-app.get('/api/state', (req, res) => {
-  res.json(state.getState());
-});
-
-app.get('/api/dealers', (req, res) => {
-  res.json({ dealers: state.getDealers() });
-});
-
-app.post('/api/dealers', (req, res) => {
-  const { id, chatId, table, firstName, lastName, username } = req.body;
-  if (!id || !table) {
-    res.status(400).json({ error: 'Both id and table are required to assign a dealer.' });
-    return;
-  }
-  if (!isDealerIdAllowed(id)) {
-    res.status(403).json({ error: 'This Telegram account is not authorized to act as a dealer.' });
-    return;
-  }
-  const dealer = state.assignDealer({ id, chatId, table, firstName, lastName, username });
-  res.status(201).json({ dealer });
-});
-
-app.delete('/api/dealers/:id', (req, res) => {
-  const removed = state.unassignDealer(req.params.id);
-  if (!removed) {
-    res.status(404).json({ error: 'Dealer not found.' });
-    return;
-  }
-  res.json({ dealer: removed });
-});
-
-app.post('/api/rounds', handleRoundRequest);
-app.post('/round', handleRoundRequest);
-
-app.post('/api/rebuys', async (req, res) => {
-  try {
-    const { record, notified, failures } = await submitRebuy(req.body || {});
-    res.json({ rebuy: record, notified, failures });
-  } catch (error) {
-    const status = Number.isInteger(error.status) ? error.status : 500;
-    if (status >= 500) {
-      console.error('Failed to process rebuy request:', error);
-    }
-    res
-      .status(status)
-      .json({ error: error.message || 'Failed to process rebuy request.' });
-  }
-});
-
-app.post('/api/eliminations', async (req, res) => {
-  try {
-    const { record, notified, failures } = await submitElimination(req.body || {});
-    res.json({ elimination: record, notified, failures });
-  } catch (error) {
-    const status = Number.isInteger(error.status) ? error.status : 500;
-    if (status >= 500) {
-      console.error('Failed to process elimination:', error);
-    }
-    res
-      .status(status)
-      .json({ error: error.message || 'Failed to process elimination.' });
-  }
-});
-
-app.use(express.static(STATIC_ROOT));
-
-app.listen(PORT, () => {
-  console.log(`Tournament manager server listening on port ${PORT}`);
-});

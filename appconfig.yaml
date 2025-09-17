@@ -1,0 +1,43 @@
+bot_token: 8348230320:AAE6k8KwF9t-grjIJ3JSuEGBAfUMqUpFKRc
+player: &players
+  - chen
+  - nir
+  - doron
+  - eldad
+  - haim
+  - amit
+  - etai
+dealers:
+  - chen
+  - nir
+number_of_tables: 2
+buy_in:
+  amount: 250
+  chips: 25000
+  currency: "₪"
+rebuy:
+  enabled: true
+  amount: 250
+  chips: 25000
+structure:
+  - level: 1
+    small_blind: 25
+    big_blind: 50
+    ante: 0
+    duration_minutes: 20
+  - level: 2
+    small_blind: 50
+    big_blind: 100
+    ante: 0
+    duration_minutes: 20
+  - level: 3
+    small_blind: 75
+    big_blind: 150
+    ante: 0
+    duration_minutes: 20
+  - level: 4
+    small_blind: 100
+    big_blind: 200
+    ante: 0
+    duration_minutes: 20
+players: *players
