@@ -6,6 +6,7 @@ const { Telegraf, Markup } = require('telegraf');
 const CONFIG = loadConfig();
 const BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || CONFIG.bot_token || CONFIG.token;
+const DEALER_PASSWORD = String(CONFIG.dealer_password || CONFIG.dealerPassword || '7788');
 
 if (!BOT_TOKEN) {
   throw new Error('Missing Telegram bot token. Set TELEGRAM_BOT_TOKEN/BOT_TOKEN or add bot_token to appconfig.');
@@ -66,9 +67,16 @@ const ACTION_ADDON = 'action:addon';
 const ACTION_ELIMINATE = 'action:eliminate';
 const ACTION_RESET_ROUND = 'action:reset_round';
 const ACTION_SKIP_ROUND = 'action:skip_round';
+const ACTION_SHOW_REBUY_HISTORY = 'show:rebuys';
+const ACTION_SHOW_ADDON_HISTORY = 'show:addons';
+const ACTION_SHOW_ELIMINATIONS = 'show:eliminations';
 const CALLBACK_REBUY_PREFIX = 'rebuy_player:';
 const CALLBACK_ADDON_PREFIX = 'addon_player:';
 const CALLBACK_ELIMINATE_PREFIX = 'eliminate_player:';
+const ACTION_SELECT_ROLE_PLAYER = 'role:player';
+const ACTION_SELECT_ROLE_DEALER = 'role:dealer';
+const ROLE_PLAYER = 'player';
+const ROLE_DEALER = 'dealer';
 
 bot.start(async (ctx) => {
   const chatId = ctx.chat?.id;
@@ -76,20 +84,98 @@ bot.start(async (ctx) => {
     return;
   }
 
-  const state = createInitialState(CONFIG);
-  chatStates.set(chatId, state);
+  let state = chatStates.get(chatId);
+  if (!state) {
+    state = createInitialState(CONFIG);
+    chatStates.set(chatId, state);
 
-  await ctx.replyWithHTML(formatTournamentSummary(state));
-  await ctx.replyWithHTML(formatSeatAssignments(state));
-  await ctx.replyWithHTML(formatStructure(state));
+    await ctx.replyWithHTML(formatTournamentSummary(state));
+    await ctx.replyWithHTML(formatSeatAssignments(state));
+    await ctx.replyWithHTML(formatStructure(state));
 
-  await startLevel(bot, chatId, state, 0, 'initial');
+    await startLevel(bot, chatId, state, 0, 'initial');
+  }
+
+  await promptForRoleSelection(ctx, state);
+});
+
+bot.command('role', async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.reply('No active tournament. Use /start to begin.');
+    return;
+  }
+
+  await promptForRoleSelection(ctx, state);
+});
+
+bot.action(ACTION_SELECT_ROLE_PLAYER, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const userId = ctx.from?.id;
+  if (!chatId || !userId) {
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.', { show_alert: true });
+    return;
+  }
+
+  state.pendingDealerAuth.delete(userId);
+  const previousRole = state.userRoles.get(userId);
+  if (previousRole === ROLE_PLAYER) {
+    await ctx.answerCbQuery('You already have player access.');
+    return;
+  }
+
+  state.userRoles.set(userId, ROLE_PLAYER);
+  await ctx.answerCbQuery('Player access granted.');
+  await ctx.reply('You now have player (viewer) access. Use the show buttons to review updates.');
+
+  if (previousRole === ROLE_DEALER) {
+    await updateMetricsMessage(bot, chatId, state);
+  }
+});
+
+bot.action(ACTION_SELECT_ROLE_DEALER, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const userId = ctx.from?.id;
+  if (!chatId || !userId) {
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.', { show_alert: true });
+    return;
+  }
+
+  if (state.userRoles.get(userId) === ROLE_DEALER) {
+    await ctx.answerCbQuery('Dealer access already granted.');
+    return;
+  }
+
+  state.pendingDealerAuth.set(userId, true);
+  await ctx.answerCbQuery();
+  await ctx.reply('Please enter the dealer password to unlock admin access:', Markup.forceReply());
 });
 
 bot.action(ACTION_REBUY, async (ctx) => {
   const state = chatStates.get(ctx.chat?.id);
   if (!state) {
     await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  if (!(await ensureDealerForAction(ctx, state))) {
     return;
   }
 
@@ -110,6 +196,10 @@ bot.action(ACTION_ADDON, async (ctx) => {
     return;
   }
 
+  if (!(await ensureDealerForAction(ctx, state))) {
+    return;
+  }
+
   await ctx.answerCbQuery();
   const keyboard = buildPlayerKeyboard(state, CALLBACK_ADDON_PREFIX, (player) => {
     const info = state.playerStatus.get(player);
@@ -127,6 +217,10 @@ bot.action(ACTION_ELIMINATE, async (ctx) => {
   const state = chatStates.get(ctx.chat?.id);
   if (!state) {
     await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  if (!(await ensureDealerForAction(ctx, state))) {
     return;
   }
 
@@ -154,6 +248,9 @@ bot.action(ACTION_RESET_ROUND, async (ctx) => {
     await ctx.answerCbQuery('No active tournament.');
     return;
   }
+  if (!(await ensureDealerForAction(ctx, state))) {
+    return;
+  }
   await ctx.answerCbQuery('Current level restarted.');
   await restartCurrentLevel(bot, chatId, state);
 });
@@ -169,6 +266,10 @@ bot.action(ACTION_SKIP_ROUND, async (ctx) => {
     return;
   }
 
+  if (!(await ensureDealerForAction(ctx, state))) {
+    return;
+  }
+
   const nextLevelIndex = state.currentLevelIndex + 1;
   if (nextLevelIndex >= state.levels.length) {
     await ctx.answerCbQuery('No more levels to skip to.');
@@ -179,11 +280,119 @@ bot.action(ACTION_SKIP_ROUND, async (ctx) => {
   await startLevel(bot, chatId, state, nextLevelIndex, 'skip');
 });
 
+bot.action(ACTION_SHOW_REBUY_HISTORY, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  await ctx.replyWithHTML(
+    formatHistoryMessage('Rebuy History', state.rebuyHistory, state.totalRebuys, 'No rebuys recorded yet.')
+  );
+});
+
+bot.action(ACTION_SHOW_ADDON_HISTORY, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  await ctx.replyWithHTML(
+    formatHistoryMessage('Add-on History', state.addonHistory, state.totalAddons, 'No add-ons recorded yet.')
+  );
+});
+
+bot.action(ACTION_SHOW_ELIMINATIONS, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  await ctx.replyWithHTML(
+    formatHistoryMessage(
+      'Elimination History',
+      state.eliminationHistory,
+      state.eliminationHistory.length,
+      'No eliminations recorded yet.'
+    )
+  );
+});
+
+bot.on('text', async (ctx, next) => {
+  const chatId = ctx.chat?.id;
+  const userId = ctx.from?.id;
+  if (!chatId || !userId) {
+    if (typeof next === 'function') {
+      await next();
+    }
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state || !state.pendingDealerAuth?.has(userId)) {
+    if (typeof next === 'function') {
+      await next();
+    }
+    return;
+  }
+
+  const text = ctx.message?.text || '';
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return;
+  }
+
+  if (trimmed.startsWith('/')) {
+    state.pendingDealerAuth.delete(userId);
+    if (typeof next === 'function') {
+      await next();
+    }
+    return;
+  }
+
+  if (trimmed === DEALER_PASSWORD) {
+    state.pendingDealerAuth.delete(userId);
+    state.userRoles.set(userId, ROLE_DEALER);
+    await tryDeleteMessage(ctx);
+    await ctx.reply('Dealer access granted. You now have full control over the tournament.');
+    await updateMetricsMessage(bot, chatId, state);
+    return;
+  }
+
+  await tryDeleteMessage(ctx);
+  await ctx.reply('Incorrect dealer password. Please try again or choose Player access with /start.');
+});
+
 bot.action(new RegExp(`^${escapeRegExp(CALLBACK_REBUY_PREFIX)}(.+)$`), async (ctx) => {
   const chatId = ctx.chat?.id;
   const state = chatStates.get(chatId);
   if (!state) {
     await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  if (!(await ensureDealerForAction(ctx, state))) {
     return;
   }
 
@@ -214,6 +423,10 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ADDON_PREFIX)}(.+)$`), async (ct
   const state = chatStates.get(chatId);
   if (!state) {
     await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  if (!(await ensureDealerForAction(ctx, state))) {
     return;
   }
 
@@ -249,6 +462,10 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ELIMINATE_PREFIX)}(.+)$`), async
   const state = chatStates.get(chatId);
   if (!state) {
     await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  if (!(await ensureDealerForAction(ctx, state))) {
     return;
   }
 
@@ -294,6 +511,8 @@ function createInitialState(config) {
     numberOfTables,
     seatAssignments,
     playerStatus,
+    userRoles: new Map(),
+    pendingDealerAuth: new Map(),
     rebuyHistory: [],
     addonHistory: [],
     eliminationHistory: [],
@@ -578,7 +797,7 @@ function formatTimeRemaining(state, level) {
 
 function updateMetricsMessage(botInstance, chatId, state) {
   const text = formatMetrics(state);
-  const keyboard = getMetricsKeyboard();
+  const keyboard = getMetricsKeyboard(state);
 
   if (state.metricsMessageId) {
     return botInstance.telegram
@@ -727,20 +946,140 @@ function buildPlayerKeyboard(state, prefix, filterFn) {
   return Markup.inlineKeyboard(rows);
 }
 
-function getMetricsKeyboard() {
-  return Markup.inlineKeyboard([
+function getMetricsKeyboard(state) {
+  const rows = [
     [
+      Markup.button.callback('📋 Show Rebuys', ACTION_SHOW_REBUY_HISTORY),
+      Markup.button.callback('📈 Show Add-ons', ACTION_SHOW_ADDON_HISTORY)
+    ],
+    [Markup.button.callback('🪦 Show Eliminations', ACTION_SHOW_ELIMINATIONS)]
+  ];
+
+  if (state && hasDealerAccess(state)) {
+    rows.push([
       Markup.button.callback('♻️ Rebuy', ACTION_REBUY),
       Markup.button.callback('➕ Add-on', ACTION_ADDON)
-    ],
-    [
-      Markup.button.callback('❌ Eliminate Player', ACTION_ELIMINATE)
-    ],
-    [
+    ]);
+    rows.push([Markup.button.callback('❌ Eliminate Player', ACTION_ELIMINATE)]);
+    rows.push([
       Markup.button.callback('🔁 Reset Round', ACTION_RESET_ROUND),
       Markup.button.callback('⏭️ Skip Round', ACTION_SKIP_ROUND)
-    ]
-  ]);
+    ]);
+  }
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function hasDealerAccess(state) {
+  if (!state || !state.userRoles) {
+    return false;
+  }
+  for (const role of state.userRoles.values()) {
+    if (role === ROLE_DEALER) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function promptForRoleSelection(ctx, state) {
+  const userId = ctx.from?.id;
+  const lines = ['Select your access level:'];
+
+  if (userId) {
+    const role = getUserRole(state, userId);
+    if (role === ROLE_DEALER) {
+      lines.push('Current role: Dealer (full access).');
+    } else if (role === ROLE_PLAYER) {
+      lines.push('Current role: Player (viewer).');
+    }
+  }
+
+  await ctx.reply(lines.join('\n'), {
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('🎮 Player', ACTION_SELECT_ROLE_PLAYER)],
+      [Markup.button.callback('🃏 Dealer', ACTION_SELECT_ROLE_DEALER)]
+    ])
+  });
+}
+
+function formatHistoryMessage(title, history, totalCount, emptyMessage) {
+  if (!Array.isArray(history) || history.length === 0) {
+    return `<b>${escapeHtml(title)}</b>\n${escapeHtml(emptyMessage)}`;
+  }
+
+  const total = Number.isFinite(totalCount) ? totalCount : history.length;
+  const recent = history.slice(-10).reverse();
+  const lines = [`<b>${escapeHtml(title)}</b>`, `Total: <b>${formatNumber(total)}</b>`, ''];
+
+  recent.forEach((entry) => {
+    const player = escapeHtml(entry?.player ?? 'Unknown');
+    const timestamp = formatHistoryTimestamp(entry?.timestamp);
+    lines.push(`• ${player}${timestamp ? ` – ${escapeHtml(timestamp)}` : ''}`);
+  });
+
+  if (history.length > recent.length) {
+    lines.push('', `Showing last ${recent.length} of ${history.length}.`);
+  }
+
+  return lines.join('\n');
+}
+
+function formatHistoryTimestamp(value) {
+  if (!value) {
+    return '';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  return date.toLocaleString('en-GB', { hour12: false });
+}
+
+async function ensureDealerForAction(ctx, state) {
+  const userId = ctx.from?.id;
+  if (!userId || !isDealer(state, userId)) {
+    await notifyDealerRequired(ctx);
+    return false;
+  }
+  return true;
+}
+
+async function notifyDealerRequired(ctx) {
+  if (typeof ctx.answerCbQuery === 'function') {
+    try {
+      await ctx.answerCbQuery('Dealer access required.', { show_alert: true });
+      return;
+    } catch (error) {
+      // Ignore callback errors and fall through to reply.
+    }
+  }
+
+  if (typeof ctx.reply === 'function') {
+    await ctx.reply('Dealer access required. Use /start to authenticate as a dealer.');
+  }
+}
+
+function isDealer(state, userId) {
+  return getUserRole(state, userId) === ROLE_DEALER;
+}
+
+function getUserRole(state, userId) {
+  if (!state || !state.userRoles) {
+    return null;
+  }
+  return state.userRoles.get(userId) || null;
+}
+
+async function tryDeleteMessage(ctx) {
+  if (typeof ctx.deleteMessage !== 'function') {
+    return;
+  }
+  try {
+    await ctx.deleteMessage();
+  } catch (error) {
+    // Ignore deletion failures (e.g., insufficient permissions).
+  }
 }
 
 function formatLevelLabel(level, index) {
