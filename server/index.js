@@ -14,6 +14,53 @@ if (!BOT_TOKEN) {
 const bot = new Telegraf(BOT_TOKEN);
 const chatStates = new Map();
 
+const LOG_DIRECTORY = path.resolve(__dirname, '..', 'logs');
+const REBUY_LOG_PATH = path.join(LOG_DIRECTORY, 'rebuy-addon.log');
+let logDirectoryEnsured = false;
+
+function ensureLogDirectory() {
+  if (logDirectoryEnsured) {
+    return;
+  }
+  try {
+    fs.mkdirSync(LOG_DIRECTORY, { recursive: true });
+    logDirectoryEnsured = true;
+  } catch (error) {
+    if (error && error.code !== 'EEXIST') {
+      console.error('Failed to create tournament log directory', error);
+    } else {
+      logDirectoryEnsured = true;
+    }
+  }
+}
+
+function logTournamentEvent(type, details) {
+  try {
+    ensureLogDirectory();
+    const timestamp = new Date().toISOString();
+    let payload = '';
+    if (details) {
+      if (typeof details === 'string') {
+        payload = details;
+      } else {
+        try {
+          payload = JSON.stringify(details);
+        } catch (serializationError) {
+          payload = String(details);
+        }
+      }
+    }
+    const line = `[${timestamp}] ${type.toUpperCase()} ${payload}\n`;
+    fs.appendFile(REBUY_LOG_PATH, line, (appendError) => {
+      if (appendError) {
+        console.error('Failed to write tournament log entry', appendError);
+      }
+    });
+  } catch (error) {
+    console.error('Failed to record tournament log entry', error);
+  }
+}
+
 const ACTION_REBUY = 'action:rebuy';
 const ACTION_ADDON = 'action:addon';
 const ACTION_ELIMINATE = 'action:eliminate';
@@ -150,6 +197,12 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_REBUY_PREFIX)}(.+)$`), async (ct
   info.rebuys += 1;
   state.totalRebuys += 1;
   state.rebuyHistory.push({ player, timestamp: new Date().toISOString() });
+  logTournamentEvent('rebuy', {
+    chatId,
+    player,
+    playerRebuys: info.rebuys,
+    totalRebuys: state.totalRebuys,
+  });
 
   await ctx.answerCbQuery(`${player} recorded for a rebuy.`);
   await safeEditMessageText(ctx, `Rebuy recorded for ${player}.`);
@@ -179,6 +232,12 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ADDON_PREFIX)}(.+)$`), async (ct
   info.addons += 1;
   state.totalAddons += 1;
   state.addonHistory.push({ player, timestamp: new Date().toISOString() });
+  logTournamentEvent('addon', {
+    chatId,
+    player,
+    playerAddons: info.addons,
+    totalAddons: state.totalAddons,
+  });
 
   await ctx.answerCbQuery(`${player} recorded for an add-on.`);
   await safeEditMessageText(ctx, `Add-on recorded for ${player}.`);

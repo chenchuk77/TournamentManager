@@ -70,12 +70,16 @@ function TournamentManager() {
   const [stateError, setStateError] = React.useState(null);
   const [statusMessage, setStatusMessage] = React.useState(null);
   const [statusType, setStatusType] = React.useState("success");
+  const [lastStateUpdate, setLastStateUpdate] = React.useState(null);
+  const [heartbeatMessage, setHeartbeatMessage] = React.useState(null);
   const [showRebuy, setShowRebuy] = React.useState(false);
   const [showElimination, setShowElimination] = React.useState(false);
   const [rebuyError, setRebuyError] = React.useState(null);
   const [eliminationError, setEliminationError] = React.useState(null);
   const [submittingRebuy, setSubmittingRebuy] = React.useState(false);
   const [submittingElimination, setSubmittingElimination] = React.useState(false);
+  const heartbeatMinuteRef = React.useRef({ value: null });
+  const audioContextRef = React.useRef(null);
 
   function minutesToMs(min) {
     return (parseInt(min, 10) || 0) * 60 * 1000;
@@ -113,12 +117,52 @@ function TournamentManager() {
   }, [levelIndex, curLevel.durationMs]);
 
   React.useEffect(() => {
+    heartbeatMinuteRef.current.value = Math.floor((curLevel.durationMs || 0) / 60000);
+  }, [curLevel.durationMs, levelIndex]);
+
+  React.useEffect(() => {
     if (!running) return;
     const id = setInterval(() => {
       setRemainingMs((ms) => Math.max(0, ms - 1000));
     }, 1000);
     return () => clearInterval(id);
   }, [running]);
+
+  const previousRunningRef = React.useRef(running);
+  React.useEffect(() => {
+    if (running && !previousRunningRef.current) {
+      heartbeatMinuteRef.current.value = Math.floor((remainingMs || 0) / 60000);
+    }
+    previousRunningRef.current = running;
+  }, [running, remainingMs]);
+
+  React.useEffect(() => {
+    if (!running) {
+      return;
+    }
+    const minuteValue = Math.floor((remainingMs || 0) / 60000);
+    const tracker = heartbeatMinuteRef.current;
+    if (tracker.value === null) {
+      tracker.value = minuteValue;
+      return;
+    }
+    if (minuteValue !== tracker.value) {
+      tracker.value = minuteValue;
+      const now = new Date();
+      playHeartbeatTone(audioContextRef);
+      setHeartbeatMessage(`Heartbeat ${formatTimeWithSeconds(now)} · ${fmtMS(remainingMs)} left`);
+    }
+  }, [remainingMs, running]);
+
+  React.useEffect(() => () => {
+    try {
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+      }
+    } catch (error) {
+      // Ignore audio context close issues.
+    }
+  }, []);
 
   const playersRemaining = players.length;
 
@@ -150,6 +194,9 @@ function TournamentManager() {
       const data = await response.json();
       setBackendState(data);
       setStateError(null);
+      const timestamp = data?.serverTime || data?.updatedAt || data?.timestamp;
+      const parsedTimestamp = timestamp ? new Date(timestamp) : new Date();
+      setLastStateUpdate(Number.isNaN(parsedTimestamp.getTime()) ? new Date() : parsedTimestamp);
     } catch (error) {
       console.error("Failed to load backend state", error);
       setStateError(error.message || "Failed to load backend state.");
@@ -289,6 +336,8 @@ function TournamentManager() {
 
   function resetLevelTimer() {
     setRemainingMs(curLevel.durationMs);
+    heartbeatMinuteRef.current.value = Math.floor((curLevel.durationMs || 0) / 60000);
+    setHeartbeatMessage(`Timer reset ${formatTimeWithSeconds(new Date())}`);
   }
 
   function openRebuy() {
@@ -370,6 +419,29 @@ function TournamentManager() {
 
   const broadcastRound = backendState?.currentRound ?? null;
 
+  const handleRestartTournament = React.useCallback(() => {
+    if (typeof window !== "undefined") {
+      const confirmed = window.confirm(
+        "Restart the tournament from level 1? This will reset the timer and resume the countdown."
+      );
+      if (!confirmed) {
+        return;
+      }
+    }
+    const firstLevel = levels[0];
+    if (!firstLevel) {
+      return;
+    }
+    setLevelIndex(0);
+    setRemainingMs(firstLevel.durationMs);
+    heartbeatMinuteRef.current.value = Math.floor((firstLevel.durationMs || 0) / 60000);
+    setRunning(true);
+    setHeartbeatMessage(
+      `Restarted ${formatTimeWithSeconds(new Date())} · ${fmtMS(firstLevel.durationMs ?? 0)}`
+    );
+    postRoundUpdate(firstLevel, 0);
+  }, [levels, postRoundUpdate]);
+
   return (
     <div className="p-3 sm:p-6">
       <DisplayBoard
@@ -389,10 +461,13 @@ function TournamentManager() {
         onPrev={handlePrevLevel}
         onNext={handleNextLevel}
         onReset={resetLevelTimer}
+        onRestartTournament={handleRestartTournament}
         onRebuy={openRebuy}
         onElimination={openElimination}
         payoutPlaces={settings.payoutPlaces}
         broadcastRound={broadcastRound}
+        lastStateUpdate={lastStateUpdate}
+        heartbeatMessage={heartbeatMessage}
       />
       {statusMessage && <StatusBanner type={statusType}>{statusMessage}</StatusBanner>}
       {stateError && <StatusBanner type="error">{stateError}</StatusBanner>}
@@ -405,6 +480,15 @@ function TournamentManager() {
         <DealerAssignments dealers={dealers} />
       </div>
       <ActivityFeed rebuys={backendRebuys} eliminations={backendEliminations} />
+      <div className="mt-6">
+        <RebuySummary
+          players={players}
+          rebuys={backendRebuys}
+          currency={settings.currency}
+          buyInValue={settings.buyInValue}
+          rebuyValue={settings.rebuyValue}
+        />
+      </div>
       {showRebuy && (
         <RebuyModal
           players={players}
@@ -452,10 +536,13 @@ function DisplayBoard({
   onPrev,
   onNext,
   onReset,
+  onRestartTournament,
   payoutPlaces,
   onRebuy,
   onElimination,
   broadcastRound,
+  lastStateUpdate,
+  heartbeatMessage,
 }) {
   const isBreak = !!level.break;
   const [localTime, setLocalTime] = React.useState(() => new Date());
@@ -491,10 +578,10 @@ function DisplayBoard({
         </div>
       </div>
       <div className="my-4 grid grid-cols-2 lg:grid-cols-4 gap-2 text-lg">
-        <InfoPill label="Round" value={level.name || "-"} />
-        <InfoPill label="Telegram Round" value={broadcastLabel} />
-        <InfoPill label="Next Break" value={nextBreakETA} />
-        <InfoPill label="# Entries" value={`${entries.buyIns}`} />
+        <InfoPill icon="🃏" label="Round" value={level.name || "-"} />
+        <InfoPill icon="📣" label="TG Round" value={broadcastLabel} />
+        <InfoPill icon="🛎️" label="Break" value={nextBreakETA} />
+        <InfoPill icon="👥" label="Entries" value={`${entries.buyIns}`} />
       </div>
       {broadcastUpdatedAt && (
         <div className="text-sm text-white/70 mb-2">
@@ -502,8 +589,22 @@ function DisplayBoard({
         </div>
       )}
       <div className="bg-black rounded-xl py-6 text-center">
-        <div className="text-[12vw] leading-none font-black">{fmtMS(remainingMs)}</div>
-        <div className="text-sm mt-1">({localStr})</div>
+        <div className="text-xs sm:text-sm uppercase tracking-[0.3em] text-white/60">
+          ⏳ Time Remaining
+          <span className="ml-2 text-white/40">
+            ({lastStateUpdate ? `updated: ${formatTimeWithSeconds(lastStateUpdate)}` : "updated: pending"})
+          </span>
+        </div>
+        <TimerDisplay remainingMs={remainingMs} />
+        <div className="text-sm mt-3 text-white/70">Local time {localStr}</div>
+        {heartbeatMessage && (
+          <div className="text-xs sm:text-sm text-emerald-300 mt-3 flex items-center justify-center gap-2">
+            <span role="img" aria-hidden="true">
+              🔔
+            </span>
+            <span>{heartbeatMessage}</span>
+          </div>
+        )}
       </div>
       <div className="text-center mt-4 text-2xl font-semibold">
         {isBreak ? "Break" : "No Limit Texas Hold 'Em"}
@@ -520,22 +621,36 @@ function DisplayBoard({
           : `Blinds ${currency}${nextLevel?.sb ?? "-"} - ${currency}${nextLevel?.bb ?? "-"}, Ante ${currency}${nextLevel?.ante ?? "-"}`}
       </div>
       <div className="grid grid-cols-2 gap-2 mt-6 text-xl">
-        <Stat label="# Paid" value={Math.min(entries.buyIns, payoutPlaces || 5)} />
-        <Stat label="# Chips" value={formatNumber(totalChips)} />
-        <Stat label="Prize Pool" value={`${currency}${formatNumber(prizePool)}`} />
-        <div className="flex items-center justify-center gap-2">
-          {running ? (
-            <button onClick={onPause} className="px-4 py-2 rounded-xl bg-red-600">
-              Pause
+        <Stat icon="🏅" label="Paid Spots" value={Math.min(entries.buyIns, payoutPlaces || 5)} />
+        <Stat icon="🎲" label="Chips" value={formatNumber(totalChips)} />
+        <Stat icon="💰" label="Prize" value={`${currency}${formatNumber(prizePool)}`} />
+        <div className="bg-green-800/70 border border-white/10 rounded-xl px-4 py-3 flex flex-col gap-3 items-center justify-center">
+          <div className="text-sm opacity-80 flex items-center gap-2">
+            <span role="img" aria-hidden="true">
+              🎛️
+            </span>
+            <span>Controls</span>
+          </div>
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            {running ? (
+              <button onClick={onPause} className="px-4 py-2 rounded-xl bg-red-600">
+                Pause
+              </button>
+            ) : (
+              <button onClick={onResume} className="px-4 py-2 rounded-xl bg-emerald-600">
+                Resume
+              </button>
+            )}
+            <button onClick={onReset} className="px-3 py-2 rounded-xl bg-neutral-700">
+              Reset Timer
             </button>
-          ) : (
-            <button onClick={onResume} className="px-4 py-2 rounded-xl bg-emerald-600">
-              Resume
+            <button
+              onClick={onRestartTournament}
+              className="px-3 py-2 rounded-xl bg-amber-600 text-black font-semibold"
+            >
+              Restart Tournament
             </button>
-          )}
-          <button onClick={onReset} className="px-3 py-2 rounded-xl bg-neutral-700">
-            Reset
-          </button>
+          </div>
         </div>
       </div>
       <div className="flex flex-wrap gap-2 mt-4 justify-center">
@@ -556,20 +671,45 @@ function DisplayBoard({
   );
 }
 
-function InfoPill({ label, value }) {
+function InfoPill({ icon, label, value }) {
   return (
     <div className="bg-green-800/70 border border-white/10 rounded-xl px-4 py-2 text-center">
-      <div className="text-sm opacity-80">{label}</div>
+      <div className="text-sm opacity-80 flex items-center justify-center gap-2">
+        {icon && (
+          <span role="img" aria-hidden="true">
+            {icon}
+          </span>
+        )}
+        <span>{label}</span>
+      </div>
       <div className="text-2xl font-bold">{value}</div>
     </div>
   );
 }
 
-function Stat({ label, value }) {
+function Stat({ icon, label, value }) {
   return (
     <div className="bg-green-800/70 border border-white/10 rounded-xl px-4 py-3 text-center">
-      <div className="text-sm opacity-80">{label}</div>
+      <div className="text-sm opacity-80 flex items-center justify-center gap-2">
+        {icon && (
+          <span role="img" aria-hidden="true">
+            {icon}
+          </span>
+        )}
+        <span>{label}</span>
+      </div>
       <div className="text-2xl font-extrabold">{value}</div>
+    </div>
+  );
+}
+
+function TimerDisplay({ remainingMs }) {
+  const { minutes, seconds } = React.useMemo(() => getCountdownParts(remainingMs), [remainingMs]);
+  return (
+    <div className="flex items-end justify-center gap-2 sm:gap-4 leading-none font-black text-white">
+      <span className="text-[22vw] sm:text-[12rem] md:text-[13rem] tabular-nums tracking-tight">{minutes}</span>
+      <span className="text-[18vw] sm:text-[9rem] md:text-[10rem] tabular-nums animate-pulse">:</span>
+      <span className="text-[22vw] sm:text-[12rem] md:text-[13rem] tabular-nums tracking-tight">{seconds}</span>
     </div>
   );
 }
@@ -735,6 +875,105 @@ function ActivityFeed({ rebuys, eliminations }) {
         )}
       </SectionCard>
     </div>
+  );
+}
+
+function RebuySummary({ players, rebuys, currency, buyInValue, rebuyValue }) {
+  const summary = React.useMemo(() => {
+    const summaryMap = new Map();
+    const registerPlayer = (rawName) => {
+      const name = (rawName || "Unknown").toString().trim() || "Unknown";
+      const key = name.toLowerCase();
+      if (!summaryMap.has(key)) {
+        summaryMap.set(key, { name, count: 0 });
+      }
+      return key;
+    };
+
+    if (Array.isArray(players)) {
+      players.forEach((player) => {
+        if (player) {
+          registerPlayer(player);
+        }
+      });
+    }
+
+    if (Array.isArray(rebuys)) {
+      rebuys.forEach((entry) => {
+        const key = registerPlayer(entry?.player);
+        const data = summaryMap.get(key);
+        data.count += 1;
+      });
+    }
+
+    const baseAmount = parseCurrencyInput(buyInValue);
+    const rebuyAmount = parseCurrencyInput(rebuyValue);
+    const canCalculateCash = Number.isFinite(baseAmount) || Number.isFinite(rebuyAmount);
+
+    const rows = Array.from(summaryMap.values()).map((item) => {
+      let total = null;
+      if (canCalculateCash) {
+        const entryCost = Number.isFinite(baseAmount) ? baseAmount : 0;
+        const rebuyCost = Number.isFinite(rebuyAmount) ? rebuyAmount * item.count : 0;
+        total = entryCost + rebuyCost;
+      }
+      return { ...item, total };
+    });
+
+    rows.sort((a, b) => {
+      if (b.count !== a.count) {
+        return b.count - a.count;
+      }
+      return a.name.localeCompare(b.name);
+    });
+
+    return {
+      rows,
+      canCalculateCash,
+      baseAmount,
+      rebuyAmount,
+    };
+  }, [players, rebuys, buyInValue, rebuyValue]);
+
+  return (
+    <SectionCard title="Rebuy overview">
+      {summary.rows.length === 0 ? (
+        <p className="text-sm text-white/70">No players or rebuys recorded yet.</p>) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm text-left">
+            <thead>
+              <tr className="text-white/60 uppercase text-xs">
+                <th className="py-2 pr-2">Player</th>
+                <th className="py-2 pr-2 text-center">Rebuys</th>
+                <th className="py-2 pr-2 text-right">Cash (entry + rebuys)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.rows.map((row) => (
+                <tr key={row.name} className="border-t border-white/10">
+                  <td className="py-2 pr-2">{row.name}</td>
+                  <td className="py-2 pr-2 text-center font-semibold">{row.count}</td>
+                  <td className="py-2 pr-2 text-right font-semibold">
+                    {summary.canCalculateCash ? formatCurrencyValue(row.total, currency) : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {!summary.canCalculateCash && (
+            <div className="text-xs text-white/60 mt-2">
+              Add buy-in and rebuy amounts in the config to calculate cash totals.
+            </div>
+          )}
+          {summary.canCalculateCash && (
+            <div className="text-xs text-white/60 mt-2">
+              Base entry: {formatCurrencyValue(summary.baseAmount, currency)} · Rebuy:{" "}
+              {formatCurrencyValue(summary.rebuyAmount, currency)}
+            </div>
+          )}
+        </div>
+      )}
+    </SectionCard>
   );
 }
 
@@ -1082,6 +1321,84 @@ function formatTablesList(tables) {
   return tables.join(", ");
 }
 
+function getCountdownParts(ms) {
+  const totalSeconds = Math.max(0, Math.floor((ms || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60)
+    .toString()
+    .padStart(2, "0");
+  const seconds = (totalSeconds % 60).toString().padStart(2, "0");
+  return { minutes, seconds };
+}
+
+function formatTimeWithSeconds(value) {
+  if (!value) {
+    return "—";
+  }
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "—";
+  }
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function parseCurrencyInput(value) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : NaN;
+  }
+  if (typeof value === "string") {
+    const cleaned = value.replace(/[^0-9.\-]/g, "");
+    if (!cleaned) {
+      return NaN;
+    }
+    const parsed = Number(cleaned);
+    return Number.isFinite(parsed) ? parsed : NaN;
+  }
+  return NaN;
+}
+
+function formatCurrencyValue(amount, currency) {
+  if (!Number.isFinite(amount)) {
+    return currency ? `${currency}—` : "—";
+  }
+  const formatted = formatNumber(amount);
+  return currency ? `${currency}${formatted}` : formatted;
+}
+
+function playHeartbeatTone(audioContextRef) {
+  try {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) {
+      return;
+    }
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+    const context = audioContextRef.current;
+    if (context.state === "suspended") {
+      context.resume().catch(() => {});
+    }
+    const oscillator = context.createOscillator();
+    const gainNode = context.createGain();
+    oscillator.type = "sine";
+    oscillator.frequency.value = 880;
+    gainNode.gain.value = 0.1;
+    oscillator.connect(gainNode);
+    gainNode.connect(context.destination);
+    const now = context.currentTime;
+    oscillator.start(now);
+    oscillator.stop(now + 0.2);
+  } catch (error) {
+    console.error("Failed to play heartbeat tone", error);
+  }
+}
+
 async function postJson(url, payload) {
   const response = await fetch(url, {
     method: "POST",
@@ -1104,7 +1421,8 @@ async function postJson(url, payload) {
 }
 
 function fmtMS(ms) {
-  const total = Math.max(0, Math.floor(ms / 1000));
+  const numeric = typeof ms === "number" && Number.isFinite(ms) ? ms : 0;
+  const total = Math.max(0, Math.floor(numeric / 1000));
   const m = Math.floor(total / 60);
   const s = total % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;
