@@ -31,10 +31,38 @@ const MAX_TRACKED_ROUNDS = 50;
 const DEALER_ACTION_CALLBACK_PREFIX = 'dealer_action:';
 const DEALER_ACTION_REBUY = 'rebuy';
 const DEALER_ACTION_ELIMINATION = 'elimination';
+const DEALER_ACTION_RECENT = 'recent';
 const DEALER_ACTIONS = [
   { key: DEALER_ACTION_REBUY, label: '♻️ Rebuy' },
-  { key: DEALER_ACTION_ELIMINATION, label: '❌ Eliminate Player' }
+  { key: DEALER_ACTION_ELIMINATION, label: '❌ Eliminate Player' },
+  { key: DEALER_ACTION_RECENT, label: '🗒 Recent activity' }
 ];
+const STATIC_ROOT = process.env.STATIC_ROOT || path.join(__dirname, '..');
+
+const TELEGRAM_ALLOWED_USER_IDS = (() => {
+  const raw =
+    process.env.TELEGRAM_ALLOWED_USER_IDS || process.env.ALLOWED_TELEGRAM_IDS || '';
+  return new Set(
+    raw
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+  );
+})();
+
+const UNAUTHORIZED_MESSAGE =
+  process.env.TELEGRAM_UNAUTHORIZED_MESSAGE ||
+  'You are not authorized to use this tournament bot. Please contact the tournament director.';
+
+function isDealerIdAllowed(id) {
+  if (!id) {
+    return false;
+  }
+  if (TELEGRAM_ALLOWED_USER_IDS.size === 0) {
+    return true;
+  }
+  return TELEGRAM_ALLOWED_USER_IDS.has(String(id));
+}
 
 function generateRoundId() {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
@@ -196,6 +224,34 @@ class TournamentState {
 
 const state = new TournamentState(PERSIST_PATH);
 const bot = new Telegraf(BOT_TOKEN);
+
+bot.use(async (ctx, next) => {
+  const telegramId = ctx.from?.id;
+  if (isDealerIdAllowed(telegramId)) {
+    return next();
+  }
+
+  const identifier = telegramId ? String(telegramId) : 'unknown';
+  const denialMessage = `${UNAUTHORIZED_MESSAGE} Your Telegram ID is ${identifier}.`;
+
+  if (ctx.updateType === 'callback_query') {
+    try {
+      await ctx.answerCbQuery('Not authorized', { show_alert: true });
+    } catch (error) {
+      console.warn('Failed to answer callback query for unauthorized user %s:', identifier, error);
+    }
+  }
+
+  if (typeof ctx.reply === 'function' && ctx.chat) {
+    try {
+      await ctx.reply(denialMessage);
+    } catch (error) {
+      console.warn('Failed to notify unauthorized user %s:', identifier, error);
+    }
+  }
+
+  console.warn('Blocked unauthorized Telegram user %s from accessing the bot.', identifier);
+});
 
 function dealerDisplayName(dealer) {
   if (dealer.firstName || dealer.lastName) {
@@ -477,6 +533,103 @@ function buildEliminationMessage(elimination) {
   return parts.join('\n');
 }
 
+function formatActivityTimestamp(timestamp) {
+  if (!timestamp) {
+    return null;
+  }
+  try {
+    const date = new Date(timestamp);
+    if (Number.isNaN(date.getTime())) {
+      return String(timestamp);
+    }
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch (error) {
+    return String(timestamp);
+  }
+}
+
+function buildRecentActivitySummary(dealer) {
+  const dealerTable = dealer?.table ? normalizeTableValue(dealer.table) : null;
+  const rebuys = Array.isArray(state.state.rebuys) ? state.state.rebuys : [];
+  const eliminations = Array.isArray(state.state.eliminations) ? state.state.eliminations : [];
+
+  const matchesTable = (record) => {
+    if (!dealerTable) {
+      return true;
+    }
+    return normalizeTableValue(record.table) === dealerTable;
+  };
+
+  const recentRebuys = rebuys.filter(matchesTable).slice(-5).reverse();
+  const recentEliminations = eliminations.filter(matchesTable).slice(-5).reverse();
+
+  const lines = [];
+  if (dealerTable) {
+    lines.push(`Recent activity for table ${dealerTable}:`);
+  } else {
+    lines.push('Recent tournament activity:');
+  }
+
+  if (recentRebuys.length === 0) {
+    lines.push('♻️ No rebuys recorded yet.');
+  } else {
+    lines.push('♻️ Rebuys');
+    recentRebuys.forEach((rebuy) => {
+      const details = [];
+      const timestamp = formatActivityTimestamp(rebuy.createdAt);
+      if (timestamp) {
+        details.push(timestamp);
+      }
+      if (!dealerTable && rebuy.table) {
+        details.push(`Table ${normalizeTableValue(rebuy.table)}`);
+      }
+      if (rebuy.player) {
+        details.push(rebuy.player);
+      }
+      if (rebuy.amount) {
+        details.push(`Amount ${rebuy.amount}`);
+      }
+      const line = details.length > 0 ? details.join(' — ') : 'Recorded';
+      lines.push(`• ${line}`);
+      if (rebuy.notes) {
+        lines.push(`    ${rebuy.notes}`);
+      }
+    });
+  }
+
+  if (recentEliminations.length === 0) {
+    lines.push('❌ No eliminations recorded yet.');
+  } else {
+    lines.push('❌ Eliminations');
+    recentEliminations.forEach((elimination) => {
+      const details = [];
+      const timestamp = formatActivityTimestamp(elimination.createdAt);
+      if (timestamp) {
+        details.push(timestamp);
+      }
+      if (!dealerTable && elimination.table) {
+        details.push(`Table ${normalizeTableValue(elimination.table)}`);
+      }
+      if (elimination.player) {
+        details.push(elimination.player);
+      }
+      if (elimination.position) {
+        details.push(`#${elimination.position}`);
+      }
+      if (elimination.payout) {
+        details.push(`Payout ${elimination.payout}`);
+      }
+      const line = details.length > 0 ? details.join(' — ') : 'Recorded';
+      lines.push(`• ${line}`);
+      if (elimination.notes) {
+        lines.push(`    ${elimination.notes}`);
+      }
+    });
+  }
+
+  return lines.join('\n');
+}
+
 function setPendingDealerAction(telegramId, payload) {
   if (telegramId === undefined || telegramId === null) {
     return;
@@ -689,6 +842,13 @@ async function handleDealerActionSelection(ctx, actionKey) {
     promptLines.push('Include payout or notes on additional lines if needed.');
     promptLines.push('Send /cancel to abort.');
     await ctx.reply(promptLines.join('\n'), Markup.forceReply());
+    return;
+  }
+
+  if (normalizedAction === DEALER_ACTION_RECENT) {
+    await ctx.answerCbQuery();
+    const summary = buildRecentActivitySummary(dealer);
+    await ctx.reply(summary);
     return;
   }
 
@@ -924,6 +1084,11 @@ bot.command('status', async (ctx) => {
   }
 });
 
+bot.command(['recent', 'history'], async (ctx) => {
+  const dealer = getDealerByTelegramId(ctx.from?.id);
+  await ctx.reply(buildRecentActivitySummary(dealer));
+});
+
 bot.on('text', async (ctx, next) => {
   const telegramId = ctx.from?.id;
   if (!telegramId) {
@@ -1011,6 +1176,10 @@ app.post('/api/dealers', (req, res) => {
     res.status(400).json({ error: 'Both id and table are required to assign a dealer.' });
     return;
   }
+  if (!isDealerIdAllowed(id)) {
+    res.status(403).json({ error: 'This Telegram account is not authorized to act as a dealer.' });
+    return;
+  }
   const dealer = state.assignDealer({ id, chatId, table, firstName, lastName, username });
   res.status(201).json({ dealer });
 });
@@ -1056,6 +1225,8 @@ app.post('/api/eliminations', async (req, res) => {
       .json({ error: error.message || 'Failed to process elimination.' });
   }
 });
+
+app.use(express.static(STATIC_ROOT));
 
 app.listen(PORT, () => {
   console.log(`Tournament manager server listening on port ${PORT}`);
