@@ -1,15 +1,25 @@
 bot_token: 8348230320:AAE6k8KwF9t-grjIJ3JSuEGBAfUMqUpFKRc
 player: &players
-  - chen
-  - nir
-  - doron
-  - eldad
-  - haim
-  - amit
-  - etai
+  - חן
+  - קנטור
+  - יובל
+  - חיים
+  - אלדד
+  - שוכמן
+  - דורון
+  - שחם
+  - וובוס
+  - פז
+  - גבע
+  - ניב
+  - אלדד_נספח
+  - יוני
+  - ינון
+  - דורי
+  - שחר
 dealers:
-  - chen
-  - nir
+  - חן
+  - קנטור
 number_of_tables: 2
 buy_in:
   amount: 250
