@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
 const { Telegraf, Markup } = require('telegraf');
+const { version: APP_VERSION } = require('../package.json');
 
 const CONFIG = loadConfig();
 const BOT_TOKEN =
@@ -70,6 +71,8 @@ const ACTION_SKIP_ROUND = 'action:skip_round';
 const ACTION_SHOW_REBUY_HISTORY = 'show:rebuys';
 const ACTION_SHOW_ADDON_HISTORY = 'show:addons';
 const ACTION_SHOW_ELIMINATIONS = 'show:eliminations';
+const ACTION_RESET_TOURNAMENT = 'action:reset_tournament';
+const ACTION_SELECT_GAME_PREFIX = 'game:select:';
 const CALLBACK_REBUY_PREFIX = 'rebuy_player:';
 const CALLBACK_ADDON_PREFIX = 'addon_player:';
 const CALLBACK_ELIMINATE_PREFIX = 'eliminate_player:';
@@ -84,6 +87,9 @@ bot.start(async (ctx) => {
     return;
   }
 
+  const versionLabel = APP_VERSION ? `v${APP_VERSION}` : 'vUnknown';
+  await ctx.reply(`Tournament Manager ${versionLabel}`);
+
   let state = chatStates.get(chatId);
   if (!state) {
     state = createInitialState(CONFIG);
@@ -96,7 +102,9 @@ bot.start(async (ctx) => {
     await startLevel(bot, chatId, state, 0, 'initial');
   }
 
+  await promptForGameSelection(ctx, state);
   await promptForRoleSelection(ctx, state);
+  await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
 bot.command('role', async (ctx) => {
@@ -112,6 +120,7 @@ bot.command('role', async (ctx) => {
   }
 
   await promptForRoleSelection(ctx, state);
+  await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
 bot.action(ACTION_SELECT_ROLE_PLAYER, async (ctx) => {
@@ -140,7 +149,7 @@ bot.action(ACTION_SELECT_ROLE_PLAYER, async (ctx) => {
   await ctx.reply('You now have player (viewer) access. Use the show buttons to review updates.');
 
   if (previousRole === ROLE_DEALER) {
-    await updateMetricsMessage(bot, chatId, state);
+    await updateMetricsMessage(bot, chatId, state, { repost: true });
   }
 });
 
@@ -166,6 +175,60 @@ bot.action(ACTION_SELECT_ROLE_DEALER, async (ctx) => {
   state.pendingDealerAuth.set(userId, true);
   await ctx.answerCbQuery();
   await ctx.reply('Please enter the dealer password to unlock admin access:', Markup.forceReply());
+});
+
+bot.action(new RegExp(`^${escapeRegExp(ACTION_SELECT_GAME_PREFIX)}(.+)$`), async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  let selectedName = '';
+  try {
+    selectedName = decodeURIComponent(ctx.match[1]);
+  } catch (error) {
+    selectedName = ctx.match[1];
+  }
+  selectedName = selectedName.trim();
+  if (!selectedName) {
+    await ctx.answerCbQuery('Unknown game selection.');
+    return;
+  }
+
+  const hasDealer = hasDealerAccess(state);
+  const userId = ctx.from?.id;
+  if (hasDealer && (!userId || !isDealer(state, userId))) {
+    await notifyDealerRequired(ctx);
+    return;
+  }
+
+  if (state.gameName === selectedName) {
+    await ctx.answerCbQuery(`${selectedName} already selected.`);
+    return;
+  }
+
+  if (state.gameNames && !state.gameNames.includes(selectedName)) {
+    await ctx.answerCbQuery('Unknown game selection.');
+    return;
+  }
+
+  await ctx.answerCbQuery(`Game set to ${selectedName}.`);
+  const newState = await resetTournament(bot, chatId, state, {
+    gameName: selectedName,
+    reason: 'select_game',
+    logType: 'select_game'
+  });
+
+  await promptForGameSelection(ctx, newState, { editExisting: true });
+  await promptForRoleSelection(ctx, newState);
+  await updateMetricsMessage(bot, chatId, newState, { repost: true });
 });
 
 bot.action(ACTION_REBUY, async (ctx) => {
@@ -280,6 +343,29 @@ bot.action(ACTION_SKIP_ROUND, async (ctx) => {
   await startLevel(bot, chatId, state, nextLevelIndex, 'skip');
 });
 
+bot.action(ACTION_RESET_TOURNAMENT, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  if (!chatId) {
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  if (!(await ensureDealerForAction(ctx, state))) {
+    return;
+  }
+
+  await ctx.answerCbQuery('Starting a fresh game.');
+  const newState = await resetTournament(bot, chatId, state, { reason: 'manual_reset' });
+  await promptForGameSelection(ctx, newState);
+  await promptForRoleSelection(ctx, newState);
+  await updateMetricsMessage(bot, chatId, newState, { repost: true });
+});
+
 bot.action(ACTION_SHOW_REBUY_HISTORY, async (ctx) => {
   const chatId = ctx.chat?.id;
   if (!chatId) {
@@ -296,6 +382,7 @@ bot.action(ACTION_SHOW_REBUY_HISTORY, async (ctx) => {
   await ctx.replyWithHTML(
     formatHistoryMessage('Rebuy History', state.rebuyHistory, state.totalRebuys, 'No rebuys recorded yet.')
   );
+  await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
 bot.action(ACTION_SHOW_ADDON_HISTORY, async (ctx) => {
@@ -314,6 +401,7 @@ bot.action(ACTION_SHOW_ADDON_HISTORY, async (ctx) => {
   await ctx.replyWithHTML(
     formatHistoryMessage('Add-on History', state.addonHistory, state.totalAddons, 'No add-ons recorded yet.')
   );
+  await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
 bot.action(ACTION_SHOW_ELIMINATIONS, async (ctx) => {
@@ -337,6 +425,7 @@ bot.action(ACTION_SHOW_ELIMINATIONS, async (ctx) => {
       'No eliminations recorded yet.'
     )
   );
+  await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
 bot.on('text', async (ctx, next) => {
@@ -376,7 +465,7 @@ bot.on('text', async (ctx, next) => {
     state.userRoles.set(userId, ROLE_DEALER);
     await tryDeleteMessage(ctx);
     await ctx.reply('Dealer access granted. You now have full control over the tournament.');
-    await updateMetricsMessage(bot, chatId, state);
+    await updateMetricsMessage(bot, chatId, state, { repost: true });
     return;
   }
 
@@ -415,7 +504,7 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_REBUY_PREFIX)}(.+)$`), async (ct
 
   await ctx.answerCbQuery(`${player} recorded for a rebuy.`);
   await safeEditMessageText(ctx, `Rebuy recorded for ${player}.`);
-  await updateMetricsMessage(bot, chatId, state);
+  await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
 bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ADDON_PREFIX)}(.+)$`), async (ctx) => {
@@ -454,7 +543,7 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ADDON_PREFIX)}(.+)$`), async (ct
 
   await ctx.answerCbQuery(`${player} recorded for an add-on.`);
   await safeEditMessageText(ctx, `Add-on recorded for ${player}.`);
-  await updateMetricsMessage(bot, chatId, state);
+  await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
 bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ELIMINATE_PREFIX)}(.+)$`), async (ctx) => {
@@ -486,7 +575,7 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ELIMINATE_PREFIX)}(.+)$`), async
 
   await ctx.answerCbQuery(`${player} eliminated.`);
   await safeEditMessageText(ctx, `${player} marked as eliminated.`);
-  await updateMetricsMessage(bot, chatId, state);
+  await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
 bot.launch();
@@ -494,7 +583,14 @@ bot.launch();
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
-function createInitialState(config) {
+function createInitialState(config, options = {}) {
+  const requestedGameName = typeof options.gameName === 'string' ? options.gameName.trim() : '';
+  const configuredGameNames = getGameNames(config);
+  const gameNames = requestedGameName
+    ? [requestedGameName, ...configuredGameNames.filter((name) => name !== requestedGameName)]
+    : configuredGameNames;
+  const gameName = gameNames[0] || 'Main Event';
+
   const players = getPlayers(config);
   const dealers = getDealers(config, players);
   const numberOfTables = getNumber(config.number_of_tables || config.numberOfTables || config.tables) || 1;
@@ -506,6 +602,8 @@ function createInitialState(config) {
 
   return {
     config,
+    gameNames,
+    gameName,
     players,
     dealers,
     numberOfTables,
@@ -611,6 +709,63 @@ function normalizeStructureEntry(entry, index) {
   return normalized;
 }
 
+function getGameNames(config) {
+  const names = new Set();
+
+  const candidates = [config?.game_names, config?.gameNames, config?.games];
+  candidates.forEach((candidate) => {
+    if (!candidate) {
+      return;
+    }
+    if (Array.isArray(candidate)) {
+      candidate.forEach((entry) => {
+        if (!entry && entry !== 0) {
+          return;
+        }
+        if (typeof entry === 'object' && entry !== null && 'name' in entry) {
+          const name = String(entry.name || '').trim();
+          if (name) {
+            names.add(name);
+          }
+          return;
+        }
+        const name = String(entry || '').trim();
+        if (name) {
+          names.add(name);
+        }
+      });
+      return;
+    }
+    if (typeof candidate === 'object' && candidate !== null && 'name' in candidate) {
+      const name = String(candidate.name || '').trim();
+      if (name) {
+        names.add(name);
+      }
+      return;
+    }
+    const name = String(candidate || '').trim();
+    if (name) {
+      names.add(name);
+    }
+  });
+
+  [config?.game_name, config?.gameName].forEach((single) => {
+    if (!single && single !== 0) {
+      return;
+    }
+    const name = String(single).trim();
+    if (name) {
+      names.add(name);
+    }
+  });
+
+  if (names.size === 0) {
+    names.add('Main Event');
+  }
+
+  return Array.from(names);
+}
+
 function getPlayers(config) {
   const raw = config.players || config.player || [];
   if (!Array.isArray(raw)) {
@@ -681,15 +836,20 @@ function formatTournamentSummary(state) {
   const dealerList = state.dealers.length
     ? state.dealers.map((dealer) => escapeHtml(dealer)).join(', ')
     : 'None';
-  const lines = [
-    '<b>Tournament Configuration</b>',
+  const lines = ['<b>Tournament Configuration</b>'];
+
+  if (state.gameName) {
+    lines.push(`Game: <b>${escapeHtml(state.gameName)}</b>`);
+  }
+
+  lines.push(
     '',
     `<b>Players (${state.players.length})</b>`,
     playersList || 'No players configured.',
     '',
     `<b>Dealers</b>: ${dealerList}`,
     `<b>Tables</b>: ${state.numberOfTables}`
-  ];
+  );
   return lines.join('\n');
 }
 
@@ -723,7 +883,13 @@ function formatStructure(state) {
 }
 
 function formatMetrics(state) {
-  const lines = ['<b>Tournament Metrics</b>', ''];
+  const lines = ['<b>Tournament Metrics</b>'];
+
+  if (state?.gameName) {
+    lines.push(`Game: <b>${escapeHtml(state.gameName)}</b>`);
+  }
+
+  lines.push('');
 
   const baseChips = getNumber(state.config?.buy_in?.chips);
   const rebuyChips = getNumber(state.config?.rebuy?.chips);
@@ -795,44 +961,106 @@ function formatTimeRemaining(state, level) {
   return formatDuration(remaining);
 }
 
-function updateMetricsMessage(botInstance, chatId, state) {
+async function updateMetricsMessage(botInstance, chatId, state, options = {}) {
   const text = formatMetrics(state);
   const keyboard = getMetricsKeyboard(state);
+  const repost = Boolean(options.repost);
+
+  if (repost) {
+    await deleteMetricsMessage(botInstance, chatId, state);
+  }
 
   if (state.metricsMessageId) {
-    return botInstance.telegram
-      .editMessageText(chatId, state.metricsMessageId, undefined, text, {
+    try {
+      await botInstance.telegram.editMessageText(chatId, state.metricsMessageId, undefined, text, {
         parse_mode: 'HTML',
         ...keyboard
-      })
-      .catch((error) => {
-        const errorCode =
-          error?.on?.payload?.error_code || error?.code || error?.response?.error_code;
-        const description =
-          error?.on?.payload?.description || error?.description || error?.response?.description || '';
-
-        if (description.includes('message is not modified')) {
-          return null;
-        }
-
-        if (errorCode === 400 || errorCode === 403 || description.includes('message to edit')) {
-          return sendMetricsMessage(botInstance, chatId, state, text, keyboard);
-        }
-
-        throw error;
       });
+      return null;
+    } catch (error) {
+      const errorCode =
+        error?.on?.payload?.error_code || error?.code || error?.response?.error_code;
+      const description =
+        error?.on?.payload?.description || error?.description || error?.response?.description || '';
+
+      if (description.includes('message is not modified')) {
+        return null;
+      }
+
+      if (errorCode === 400 || errorCode === 403 || description.includes('message to edit')) {
+        return sendMetricsMessage(botInstance, chatId, state, text, keyboard);
+      }
+
+      throw error;
+    }
   }
 
   return sendMetricsMessage(botInstance, chatId, state, text, keyboard);
 }
 
 function sendMetricsMessage(botInstance, chatId, state, text, keyboard) {
-  return botInstance.telegram
-    .sendMessage(chatId, text, { parse_mode: 'HTML', ...keyboard })
-    .then((message) => {
-      state.metricsMessageId = message.message_id;
-      return message;
-    });
+  return botInstance.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', ...keyboard }).then((message) => {
+    state.metricsMessageId = message.message_id;
+    return message;
+  });
+}
+
+async function deleteMetricsMessage(botInstance, chatId, state) {
+  if (!state.metricsMessageId) {
+    return;
+  }
+
+  try {
+    await botInstance.telegram.deleteMessage(chatId, state.metricsMessageId);
+  } catch (error) {
+    const description =
+      error?.on?.payload?.description || error?.description || error?.response?.description || '';
+    if (!description.includes('message to delete')) {
+      const errorCode =
+        error?.on?.payload?.error_code || error?.code || error?.response?.error_code;
+      if (errorCode !== 400 && errorCode !== 403) {
+        throw error;
+      }
+    }
+  } finally {
+    state.metricsMessageId = null;
+  }
+}
+
+async function resetTournament(botInstance, chatId, currentState, options = {}) {
+  const gameName = typeof options.gameName === 'string' ? options.gameName.trim() : '';
+  const reason = options.reason || 'reset_tournament';
+  const logType = options.logType || 'reset_tournament';
+  const previousRoles = currentState?.userRoles ? Array.from(currentState.userRoles.entries()) : [];
+
+  clearLevelTimers(currentState);
+  await deleteMetricsMessage(botInstance, chatId, currentState);
+
+  const baseConfig = currentState?.config || CONFIG;
+  const nextState = createInitialState(baseConfig, { gameName });
+  if (previousRoles.length > 0) {
+    nextState.userRoles = new Map(previousRoles);
+  }
+
+  chatStates.set(chatId, nextState);
+
+  logTournamentEvent(logType, {
+    chatId,
+    reason,
+    gameName: nextState.gameName
+  });
+
+  await botInstance.telegram.sendMessage(
+    chatId,
+    `<b>Starting new game:</b> ${escapeHtml(nextState.gameName)}`,
+    { parse_mode: 'HTML' }
+  );
+  await botInstance.telegram.sendMessage(chatId, formatTournamentSummary(nextState), { parse_mode: 'HTML' });
+  await botInstance.telegram.sendMessage(chatId, formatSeatAssignments(nextState), { parse_mode: 'HTML' });
+  await botInstance.telegram.sendMessage(chatId, formatStructure(nextState), { parse_mode: 'HTML' });
+
+  await startLevel(botInstance, chatId, nextState, 0, reason);
+  return nextState;
 }
 
 async function startLevel(botInstance, chatId, state, levelIndex, reason) {
@@ -842,7 +1070,7 @@ async function startLevel(botInstance, chatId, state, levelIndex, reason) {
     state.currentLevelIndex = state.levels.length;
     state.levelStartTime = null;
     await botInstance.telegram.sendMessage(chatId, 'All blind levels completed.');
-    await updateMetricsMessage(botInstance, chatId, state);
+    await updateMetricsMessage(botInstance, chatId, state, { repost: reason !== 'auto' });
     return;
   }
 
@@ -862,7 +1090,7 @@ async function startLevel(botInstance, chatId, state, levelIndex, reason) {
   await botInstance.telegram.sendMessage(chatId, `${prefix} ${label}`);
 
   scheduleLevelTimers(botInstance, chatId, state, level, label);
-  await updateMetricsMessage(botInstance, chatId, state);
+  await updateMetricsMessage(botInstance, chatId, state, { repost: reason !== 'auto' });
 }
 
 async function restartCurrentLevel(botInstance, chatId, state) {
@@ -965,7 +1193,21 @@ function getMetricsKeyboard(state) {
       Markup.button.callback('🔁 Reset Round', ACTION_RESET_ROUND),
       Markup.button.callback('⏭️ Skip Round', ACTION_SKIP_ROUND)
     ]);
+    rows.push([Markup.button.callback('🔄 New Game', ACTION_RESET_TOURNAMENT)]);
   }
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function getGameSelectionKeyboard(state) {
+  if (!state?.gameNames || state.gameNames.length === 0) {
+    return null;
+  }
+
+  const rows = state.gameNames.map((name) => {
+    const label = state.gameName === name ? `✅ ${name}` : name;
+    return [Markup.button.callback(label, `${ACTION_SELECT_GAME_PREFIX}${encodeURIComponent(name)}`)];
+  });
 
   return Markup.inlineKeyboard(rows);
 }
@@ -1001,6 +1243,40 @@ async function promptForRoleSelection(ctx, state) {
       [Markup.button.callback('🃏 Dealer', ACTION_SELECT_ROLE_DEALER)]
     ])
   });
+}
+
+async function promptForGameSelection(ctx, state, options = {}) {
+  if (!state?.gameNames || state.gameNames.length === 0) {
+    return;
+  }
+
+  if (state.gameNames.length <= 1) {
+    return;
+  }
+
+  const keyboard = getGameSelectionKeyboard(state);
+  if (!keyboard) {
+    return;
+  }
+
+  const prompt = state.gameName
+    ? `Select the game to run (current: ${state.gameName}):`
+    : 'Select the game to run:';
+
+  if (options.editExisting && typeof ctx.editMessageText === 'function') {
+    try {
+      await ctx.editMessageText(prompt, { ...keyboard });
+      return;
+    } catch (error) {
+      const description =
+        error?.on?.payload?.description || error?.description || error?.response?.description || '';
+      if (description.includes('message is not modified')) {
+        return;
+      }
+    }
+  }
+
+  await ctx.reply(prompt, keyboard);
 }
 
 function formatHistoryMessage(title, history, totalCount, emptyMessage) {
