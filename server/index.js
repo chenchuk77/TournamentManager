@@ -65,6 +65,8 @@ function logTournamentEvent(type, details) {
 
 const ACTION_REBUY = 'action:rebuy';
 const ACTION_ADDON = 'action:addon';
+const ACTION_ADDON_CONFIRM = 'addon:confirm';
+const ACTION_ADDON_CANCEL = 'addon:cancel';
 const ACTION_ELIMINATE = 'action:eliminate';
 const ACTION_RESET_ROUND = 'action:reset_round';
 const ACTION_SKIP_ROUND = 'action:skip_round';
@@ -75,7 +77,7 @@ const ACTION_SHOW_ELIMINATIONS = 'show:eliminations';
 const ACTION_RESET_TOURNAMENT = 'action:reset_tournament';
 const ACTION_SELECT_GAME_PREFIX = 'game:select:';
 const CALLBACK_REBUY_PREFIX = 'rebuy_player:';
-const CALLBACK_ADDON_PREFIX = 'addon_player:';
+const CALLBACK_ADDON_TOGGLE_PREFIX = 'addon_toggle:';
 const CALLBACK_ELIMINATE_PREFIX = 'eliminate_player:';
 const ACTION_SELECT_ROLE_PLAYER = 'role:player';
 const ACTION_SELECT_ROLE_DEALER = 'role:dealer';
@@ -254,7 +256,8 @@ bot.action(ACTION_REBUY, async (ctx) => {
 });
 
 bot.action(ACTION_ADDON, async (ctx) => {
-  const state = chatStates.get(ctx.chat?.id);
+  const chatId = ctx.chat?.id;
+  const state = chatStates.get(chatId);
   if (!state) {
     await ctx.answerCbQuery('No active tournament.');
     return;
@@ -265,16 +268,45 @@ bot.action(ACTION_ADDON, async (ctx) => {
   }
 
   await ctx.answerCbQuery();
-  const keyboard = buildPlayerKeyboard(state, CALLBACK_ADDON_PREFIX, (player) => {
+  const eligiblePlayers = state.players.filter((player) => {
     const info = state.playerStatus.get(player);
     return info && !info.eliminated;
   });
-  if (!keyboard) {
+
+  if (!eligiblePlayers.length) {
     await ctx.reply('No active players available for an add-on right now.');
     return;
   }
 
-  await ctx.reply('Select a player for the add-on:', keyboard);
+  if (state.pendingAddonSelection?.messageId && chatId) {
+    try {
+      await ctx.telegram.deleteMessage(chatId, state.pendingAddonSelection.messageId);
+    } catch (error) {
+      const description =
+        error?.on?.payload?.description || error?.description || error?.response?.description || '';
+      if (!description.includes('message to delete')) {
+        const errorCode =
+          error?.on?.payload?.error_code || error?.code || error?.response?.error_code;
+        if (errorCode !== 400 && errorCode !== 403) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  const selectionState = {
+    messageId: null,
+    players: eligiblePlayers,
+    selections: new Map()
+  };
+  eligiblePlayers.forEach((player) => selectionState.selections.set(player, true));
+  state.pendingAddonSelection = selectionState;
+
+  const keyboard = buildAddonSelectionKeyboard(selectionState);
+  const message = await ctx.replyWithHTML(formatAddonSelectionText(state, selectionState), {
+    reply_markup: keyboard.reply_markup
+  });
+  selectionState.messageId = message.message_id;
 });
 
 bot.action(ACTION_ELIMINATE, async (ctx) => {
@@ -533,7 +565,7 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_REBUY_PREFIX)}(.+)$`), async (ct
   await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
-bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ADDON_PREFIX)}(.+)$`), async (ctx) => {
+bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ADDON_TOGGLE_PREFIX)}(.+)$`), async (ctx) => {
   const chatId = ctx.chat?.id;
   const state = chatStates.get(chatId);
   if (!state) {
@@ -546,30 +578,129 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ADDON_PREFIX)}(.+)$`), async (ct
   }
 
   const player = decodeURIComponent(ctx.match[1]);
-  const info = state.playerStatus.get(player);
-  if (!info) {
-    await ctx.answerCbQuery('Unknown player.');
+  const pending = state.pendingAddonSelection;
+  const messageId = ctx.callbackQuery?.message?.message_id;
+
+  if (!pending || pending.messageId !== messageId) {
+    await ctx.answerCbQuery('Add-on selection expired.');
     return;
   }
 
-  if (info.eliminated) {
-    await ctx.answerCbQuery(`${player} is eliminated and cannot take an add-on.`);
+  if (!pending.selections.has(player)) {
+    await ctx.answerCbQuery('Player not available.');
     return;
   }
 
-  info.addons += 1;
-  state.totalAddons += 1;
-  state.addonHistory.push({ player, timestamp: new Date().toISOString() });
-  logTournamentEvent('addon', {
-    chatId,
-    player,
-    playerAddons: info.addons,
-    totalAddons: state.totalAddons,
+  const nextValue = !pending.selections.get(player);
+  pending.selections.set(player, nextValue);
+
+  await ctx.answerCbQuery(nextValue ? `${player} included.` : `${player} skipped.`);
+
+  await refreshAddonSelectionMessage(ctx, state);
+});
+
+bot.action(ACTION_ADDON_CONFIRM, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  if (!(await ensureDealerForAction(ctx, state))) {
+    return;
+  }
+
+  const pending = state.pendingAddonSelection;
+  const messageId = ctx.callbackQuery?.message?.message_id;
+
+  if (!pending || pending.messageId !== messageId) {
+    await ctx.answerCbQuery('Add-on selection expired.');
+    return;
+  }
+
+  const selectedPlayers = pending.players.filter((player) => pending.selections.get(player));
+  if (selectedPlayers.length === 0) {
+    await ctx.answerCbQuery('Select at least one player.', { show_alert: true });
+    return;
+  }
+
+  const recorded = [];
+  const ineligible = [];
+  const timestamp = new Date();
+
+  selectedPlayers.forEach((player) => {
+    const info = state.playerStatus.get(player);
+    if (!info || info.eliminated) {
+      ineligible.push(player);
+      return;
+    }
+    info.addons += 1;
+    state.totalAddons += 1;
+    const entryTimestamp = new Date().toISOString();
+    state.addonHistory.push({ player, timestamp: entryTimestamp });
+    logTournamentEvent('addon', {
+      chatId,
+      player,
+      playerAddons: info.addons,
+      totalAddons: state.totalAddons,
+      batchTimestamp: timestamp.toISOString(),
+      batchSize: selectedPlayers.length
+    });
+    recorded.push(player);
   });
 
-  await ctx.answerCbQuery(`${player} recorded for an add-on.`);
-  await safeEditMessageText(ctx, `Add-on recorded for ${player}.`);
+  state.pendingAddonSelection = null;
+
+  if (recorded.length === 0) {
+    await ctx.answerCbQuery('No eligible players were recorded.', { show_alert: true });
+    await ctx.editMessageText('No add-ons were recorded.', { parse_mode: 'HTML' });
+    return;
+  }
+
+  const summaryLines = [
+    `<b>✅ Recorded add-ons for ${recorded.length} player${recorded.length === 1 ? '' : 's'}.</b>`
+  ];
+  summaryLines.push(
+    '',
+    recorded.map((name) => `• ${escapeHtml(name)}`).join('\n')
+  );
+
+  if (ineligible.length > 0) {
+    summaryLines.push(
+      '',
+      `Skipped (ineligible): ${ineligible.map((name) => escapeHtml(name)).join(', ')}`
+    );
+  }
+
+  await ctx.answerCbQuery('Add-ons recorded.');
+  await ctx.editMessageText(summaryLines.join('\n'), { parse_mode: 'HTML' });
   await updateMetricsMessage(bot, chatId, state, { repost: true });
+});
+
+bot.action(ACTION_ADDON_CANCEL, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  if (!(await ensureDealerForAction(ctx, state))) {
+    return;
+  }
+
+  const pending = state.pendingAddonSelection;
+  const messageId = ctx.callbackQuery?.message?.message_id;
+
+  if (!pending || pending.messageId !== messageId) {
+    await ctx.answerCbQuery('Add-on selection expired.');
+    return;
+  }
+
+  state.pendingAddonSelection = null;
+  await ctx.answerCbQuery('Selection cancelled.');
+  await ctx.editMessageText('Add-on selection cancelled.', { parse_mode: 'HTML' });
 });
 
 bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ELIMINATE_PREFIX)}(.+)$`), async (ctx) => {
@@ -650,7 +781,8 @@ function createInitialState(config, options = {}) {
       end: null,
       metricsInterval: null
     },
-    metricsMessageId: null
+    metricsMessageId: null,
+    pendingAddonSelection: null
   };
 }
 
@@ -909,13 +1041,8 @@ function formatStructure(state) {
 }
 
 function formatMetrics(state) {
-  const lines = ['<b>Tournament Metrics</b>'];
-
-  if (state?.gameName) {
-    lines.push(`Game: <b>${escapeHtml(state.gameName)}</b>`);
-  }
-
-  lines.push('');
+  const title = state?.gameName ? escapeHtml(state.gameName) : 'Tournament';
+  const lines = [`<b>🎯 ${title}</b>`];
 
   const baseChips = getNumber(state.config?.buy_in?.chips);
   const rebuyChips = getNumber(state.config?.rebuy?.chips);
@@ -925,7 +1052,7 @@ function formatMetrics(state) {
   const totalAddonChips = Number.isFinite(addonChips) ? addonChips * state.totalAddons : 0;
   if (totalBaseChips !== null || totalRebuyChips > 0 || totalAddonChips > 0) {
     const totalChips = (totalBaseChips ?? 0) + totalRebuyChips + totalAddonChips;
-    lines.push(`Total chips in play: <b>${formatNumber(totalChips)}</b>`);
+    lines.push(`🪙 Total chips: <b>${formatNumber(totalChips)}</b>`);
   }
 
   const baseAmount = getNumber(state.config?.buy_in?.amount);
@@ -941,39 +1068,128 @@ function formatMetrics(state) {
   const totalAddonPrize = Number.isFinite(addonAmount) ? addonAmount * state.totalAddons : 0;
   if (totalBasePrize !== null || totalRebuyPrize > 0 || totalAddonPrize > 0) {
     const totalPrize = (totalBasePrize ?? 0) + totalRebuyPrize + totalAddonPrize;
-    lines.push(`Prize pool: <b>${escapeHtml(formatAmount(totalPrize, currency))}</b>`);
+    lines.push(`💰 Prize pool: <b>${escapeHtml(formatAmount(totalPrize, currency))}</b>`);
   }
 
+  const totalPlayers = state.players.length;
   const activePlayers = Array.from(state.playerStatus.values()).filter((info) => !info.eliminated)
     .length;
-  lines.push(`Active players: <b>${activePlayers}</b>`);
+  lines.push(`👥 Players: <b>${activePlayers}/${totalPlayers}</b>`);
+  lines.push(`♻️ Rebuys/Add-ons: <b>${state.totalRebuys}/${state.totalAddons}</b>`);
 
-  const eliminatedPlayers = Array.from(state.playerStatus.entries())
-    .filter(([, info]) => info.eliminated)
-    .map(([player]) => escapeHtml(player));
-  lines.push(
-    `Eliminated players: ${eliminatedPlayers.length ? eliminatedPlayers.join(', ') : 'None'}`
-  );
-
-  lines.push(`Rebuys logged: <b>${state.totalRebuys}</b>`);
-  lines.push(`Add-ons logged: <b>${state.totalAddons}</b>`);
-
-  const level = state.levels[state.currentLevelIndex];
+  const levelIndex = state.currentLevelIndex;
+  const level = state.levels[levelIndex];
   if (level) {
-    lines.push(`Current level: ${escapeHtml(formatLevelLabel(level, state.currentLevelIndex))}`);
+    const levelTitle = formatLevelTitle(level, levelIndex);
+    const durationMinutes = getLevelDurationMinutes(level);
+    const durationLabel = Number.isFinite(durationMinutes) ? `${durationMinutes}m` : null;
     const remaining = formatTimeRemaining(state, level);
-    if (remaining) {
-      lines.push(`Time remaining: ${remaining}`);
+    const headerParts = [
+      `${level.break ? '☕' : '⏱️'} ${escapeHtml(levelTitle)}`
+    ];
+    if (durationLabel) {
+      headerParts.push(`(${escapeHtml(durationLabel)})`);
     }
-    const nextLevel = state.levels[state.currentLevelIndex + 1];
+    const header = headerParts.join(' ');
+    if (remaining) {
+      lines.push(`${header} remaining: <b>${remaining}</b>`);
+    } else {
+      lines.push(header);
+    }
+
+    if (!level.break) {
+      const blinds = formatLevelBlindsBrief(level);
+      if (blinds) {
+        lines.push(`🃏 <b>${escapeHtml(blinds)}</b>`);
+      }
+    }
+
+    const nextLevel = state.levels[levelIndex + 1];
     if (nextLevel) {
-      lines.push(`Next level: ${escapeHtml(formatLevelLabel(nextLevel, state.currentLevelIndex + 1))}`);
+      if (nextLevel.break) {
+        const nextTitle = formatLevelTitle(nextLevel, levelIndex + 1);
+        const nextDuration = getLevelDurationMinutes(nextLevel);
+        const parts = ['⬆️ Next: ☕', escapeHtml(nextTitle)];
+        if (Number.isFinite(nextDuration)) {
+          parts.push(escapeHtml(`(${nextDuration}m)`));
+        }
+        lines.push(parts.join(' '));
+      } else {
+        const nextBlinds = formatLevelBlindsBrief(nextLevel);
+        const nextDuration = getLevelDurationMinutes(nextLevel);
+        const nextParts = [];
+        if (nextBlinds) {
+          nextParts.push(escapeHtml(nextBlinds));
+        }
+        if (Number.isFinite(nextDuration)) {
+          nextParts.push(escapeHtml(`(${nextDuration}m)`));
+        }
+        const label = nextParts.length ? nextParts.join(' ') : '—';
+        lines.push(`⬆️ Next level: <b>${label}</b>`);
+      }
     }
   } else {
-    lines.push('Structure complete.');
+    lines.push('✅ Structure complete.');
   }
 
   return lines.join('\n');
+}
+
+function formatLevelTitle(level, index) {
+  if (!level) {
+    return `Level ${index + 1}`;
+  }
+
+  if (level.break) {
+    const breakLabels = [level.label, level.name];
+    for (const value of breakLabels) {
+      if (typeof value === 'string' && value.trim()) {
+        return value.trim();
+      }
+    }
+    return 'Break';
+  }
+
+  const numberCandidates = [level.round, level.level, level.level_number, level.number];
+  for (const candidate of numberCandidates) {
+    const number = getNumber(candidate);
+    if (Number.isFinite(number)) {
+      return `Level ${number}`;
+    }
+  }
+
+  if (typeof level.name === 'string' && level.name.trim()) {
+    return level.name.trim();
+  }
+
+  return `Level ${index + 1}`;
+}
+
+function formatLevelBlindsBrief(level) {
+  if (!level || level.break) {
+    return '';
+  }
+
+  if (typeof level.blinds === 'string' && level.blinds.trim()) {
+    return level.blinds.trim();
+  }
+
+  const smallBlind = getNumber(level.sb ?? level.small_blind ?? level.smallBlind);
+  const bigBlind = getNumber(level.bb ?? level.big_blind ?? level.bigBlind);
+  const anteNumber = getNumber(level.ante);
+
+  const parts = [];
+  if (Number.isFinite(smallBlind) && Number.isFinite(bigBlind)) {
+    parts.push(`${formatNumber(smallBlind)}/${formatNumber(bigBlind)}`);
+  } else if (Number.isFinite(bigBlind)) {
+    parts.push(formatNumber(bigBlind));
+  }
+
+  if (Number.isFinite(anteNumber) && anteNumber > 0) {
+    parts.push(`Ante ${formatNumber(anteNumber)}`);
+  }
+
+  return parts.join(' · ');
 }
 
 function formatTimeRemaining(state, level) {
@@ -1198,6 +1414,87 @@ function buildPlayerKeyboard(state, prefix, filterFn) {
     rows.push(buttons.slice(index, index + 2));
   }
   return Markup.inlineKeyboard(rows);
+}
+
+function buildAddonSelectionKeyboard(selectionState) {
+  const buttons = selectionState.players.map((player) => {
+    const selected = selectionState.selections.get(player);
+    const prefix = selected ? '✅' : '⬜️';
+    return Markup.button.callback(
+      `${prefix} ${player}`,
+      `${CALLBACK_ADDON_TOGGLE_PREFIX}${encodeURIComponent(player)}`
+    );
+  });
+
+  const rows = [];
+  for (let index = 0; index < buttons.length; index += 2) {
+    rows.push(buttons.slice(index, index + 2));
+  }
+
+  const selectedCount = countSelectedAddonPlayers(selectionState);
+  const confirmLabel = selectedCount > 0 ? `💾 Record (${selectedCount})` : '🚫 Record (0)';
+  rows.push([Markup.button.callback(confirmLabel, ACTION_ADDON_CONFIRM)]);
+  rows.push([Markup.button.callback('✖️ Cancel', ACTION_ADDON_CANCEL)]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function countSelectedAddonPlayers(selectionState) {
+  let count = 0;
+  selectionState.selections.forEach((value) => {
+    if (value) {
+      count += 1;
+    }
+  });
+  return count;
+}
+
+function formatAddonSelectionText(state, selectionState) {
+  const selectedCount = countSelectedAddonPlayers(selectionState);
+  const total = selectionState.players.length;
+  const skipped = selectionState.players.filter((player) => !selectionState.selections.get(player));
+
+  const lines = ['<b>➕ Record Add-ons</b>', 'Tap to uncheck players who are skipping the add-on.', ''];
+  lines.push(`Selected: <b>${selectedCount}</b> of ${total}`);
+
+  if (skipped.length > 0) {
+    lines.push('', `Skipping: ${skipped.map((name) => escapeHtml(name)).join(', ')}`);
+  } else {
+    lines.push('', 'All active players will receive an add-on.');
+  }
+
+  if (state?.gameName) {
+    lines.push('', `Game: <b>${escapeHtml(state.gameName)}</b>`);
+  }
+
+  return lines.join('\n');
+}
+
+async function refreshAddonSelectionMessage(ctx, state) {
+  const pending = state.pendingAddonSelection;
+  if (!pending) {
+    return;
+  }
+
+  const text = formatAddonSelectionText(state, pending);
+  const keyboard = buildAddonSelectionKeyboard(pending);
+
+  try {
+    await ctx.editMessageText(text, {
+      parse_mode: 'HTML',
+      reply_markup: keyboard.reply_markup
+    });
+  } catch (error) {
+    const description =
+      error?.on?.payload?.description || error?.description || error?.response?.description || '';
+    if (!description.includes('message is not modified')) {
+      const errorCode = error?.on?.payload?.error_code || error?.code || error?.response?.error_code;
+      if (errorCode !== 400 || !description.includes('message to edit')) {
+        throw error;
+      }
+      state.pendingAddonSelection = null;
+    }
+  }
 }
 
 function getMetricsKeyboard(state) {
