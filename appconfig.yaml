@@ -1,5 +1,8 @@
 bot_token: 8348230320:AAE6k8KwF9t-grjIJ3JSuEGBAfUMqUpFKRc
 dealer_password: "7788"
+game_names:
+  - Main Event
+  - Knockout Night
 player: &players
   - חן
   - קנטור
