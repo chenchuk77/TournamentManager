@@ -15,10 +15,12 @@ const bot = new Telegraf(BOT_TOKEN);
 const chatStates = new Map();
 
 const ACTION_REBUY = 'action:rebuy';
+const ACTION_ADDON = 'action:addon';
 const ACTION_ELIMINATE = 'action:eliminate';
 const ACTION_RESET_ROUND = 'action:reset_round';
 const ACTION_SKIP_ROUND = 'action:skip_round';
 const CALLBACK_REBUY_PREFIX = 'rebuy_player:';
+const CALLBACK_ADDON_PREFIX = 'addon_player:';
 const CALLBACK_ELIMINATE_PREFIX = 'eliminate_player:';
 
 bot.start(async (ctx) => {
@@ -52,6 +54,26 @@ bot.action(ACTION_REBUY, async (ctx) => {
   }
 
   await ctx.reply('Select a player for the rebuy:', keyboard);
+});
+
+bot.action(ACTION_ADDON, async (ctx) => {
+  const state = chatStates.get(ctx.chat?.id);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  const keyboard = buildPlayerKeyboard(state, CALLBACK_ADDON_PREFIX, (player) => {
+    const info = state.playerStatus.get(player);
+    return info && !info.eliminated;
+  });
+  if (!keyboard) {
+    await ctx.reply('No active players available for an add-on right now.');
+    return;
+  }
+
+  await ctx.reply('Select a player for the add-on:', keyboard);
 });
 
 bot.action(ACTION_ELIMINATE, async (ctx) => {
@@ -134,6 +156,35 @@ bot.action(new RegExp(`^${escapeRegExp(CALLBACK_REBUY_PREFIX)}(.+)$`), async (ct
   await updateMetricsMessage(bot, chatId, state);
 });
 
+bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ADDON_PREFIX)}(.+)$`), async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  const player = decodeURIComponent(ctx.match[1]);
+  const info = state.playerStatus.get(player);
+  if (!info) {
+    await ctx.answerCbQuery('Unknown player.');
+    return;
+  }
+
+  if (info.eliminated) {
+    await ctx.answerCbQuery(`${player} is eliminated and cannot take an add-on.`);
+    return;
+  }
+
+  info.addons += 1;
+  state.totalAddons += 1;
+  state.addonHistory.push({ player, timestamp: new Date().toISOString() });
+
+  await ctx.answerCbQuery(`${player} recorded for an add-on.`);
+  await safeEditMessageText(ctx, `Add-on recorded for ${player}.`);
+  await updateMetricsMessage(bot, chatId, state);
+});
+
 bot.action(new RegExp(`^${escapeRegExp(CALLBACK_ELIMINATE_PREFIX)}(.+)$`), async (ctx) => {
   const chatId = ctx.chat?.id;
   const state = chatStates.get(chatId);
@@ -174,7 +225,7 @@ function createInitialState(config) {
   const seatAssignments = assignSeats(players, dealers, numberOfTables);
   const playerStatus = new Map();
   players.forEach((player) => {
-    playerStatus.set(player, { rebuys: 0, eliminated: false });
+    playerStatus.set(player, { rebuys: 0, addons: 0, eliminated: false });
   });
 
   return {
@@ -185,17 +236,101 @@ function createInitialState(config) {
     seatAssignments,
     playerStatus,
     rebuyHistory: [],
+    addonHistory: [],
     eliminationHistory: [],
     totalRebuys: 0,
-    levels: Array.isArray(config.structure) ? config.structure : [],
+    totalAddons: 0,
+    levels: normalizeStructure(config.structure),
     currentLevelIndex: 0,
     levelStartTime: null,
     levelTimers: {
       warning: null,
-      end: null
+      end: null,
+      metricsInterval: null
     },
     metricsMessageId: null
   };
+}
+
+function normalizeStructure(structure) {
+  if (!Array.isArray(structure)) {
+    return [];
+  }
+
+  return structure
+    .map((entry, index) => normalizeStructureEntry(entry, index))
+    .filter((entry) => entry !== null);
+}
+
+function normalizeStructureEntry(entry, index) {
+  if (!entry || typeof entry !== 'object') {
+    return null;
+  }
+
+  const normalized = { ...entry };
+
+  if (normalized.break || normalized.type === 'break') {
+    normalized.break = true;
+    const duration = resolveNumber(
+      normalized.time,
+      normalized.duration_minutes,
+      normalized.duration,
+      normalized.minutes
+    );
+    if (Number.isFinite(duration)) {
+      normalized.duration_minutes = duration;
+      normalized.time = duration;
+    }
+    if (!normalized.label) {
+      normalized.label = 'Break';
+    }
+    return normalized;
+  }
+
+  const roundNumber = resolveNumber(
+    normalized.round,
+    normalized.level,
+    normalized.level_number,
+    normalized.number
+  );
+  const resolvedRound = Number.isFinite(roundNumber) ? roundNumber : index + 1;
+  normalized.round = resolvedRound;
+  if (!normalized.level) {
+    normalized.level = resolvedRound;
+  }
+  if (!normalized.level_number) {
+    normalized.level_number = resolvedRound;
+  }
+
+  const sb = resolveNumber(normalized.sb, normalized.small_blind, normalized.smallBlind);
+  if (Number.isFinite(sb)) {
+    normalized.small_blind = sb;
+    normalized.sb = sb;
+  }
+
+  const bb = resolveNumber(normalized.bb, normalized.big_blind, normalized.bigBlind);
+  if (Number.isFinite(bb)) {
+    normalized.big_blind = bb;
+    normalized.bb = bb;
+  }
+
+  const ante = resolveNumber(normalized.ante, normalized.ante_amount, normalized.anteAmount);
+  if (Number.isFinite(ante)) {
+    normalized.ante = ante;
+  }
+
+  const duration = resolveNumber(
+    normalized.time,
+    normalized.duration_minutes,
+    normalized.duration,
+    normalized.minutes
+  );
+  if (Number.isFinite(duration)) {
+    normalized.duration_minutes = duration;
+    normalized.time = duration;
+  }
+
+  return normalized;
 }
 
 function getPlayers(config) {
@@ -314,20 +449,28 @@ function formatMetrics(state) {
 
   const baseChips = getNumber(state.config?.buy_in?.chips);
   const rebuyChips = getNumber(state.config?.rebuy?.chips);
+  const addonChips = getNumber(state.config?.addon?.chips);
   const totalBaseChips = Number.isFinite(baseChips) ? baseChips * state.players.length : null;
   const totalRebuyChips = Number.isFinite(rebuyChips) ? rebuyChips * state.totalRebuys : 0;
-  if (totalBaseChips !== null || totalRebuyChips > 0) {
-    const totalChips = (totalBaseChips ?? 0) + totalRebuyChips;
+  const totalAddonChips = Number.isFinite(addonChips) ? addonChips * state.totalAddons : 0;
+  if (totalBaseChips !== null || totalRebuyChips > 0 || totalAddonChips > 0) {
+    const totalChips = (totalBaseChips ?? 0) + totalRebuyChips + totalAddonChips;
     lines.push(`Total chips in play: <b>${formatNumber(totalChips)}</b>`);
   }
 
   const baseAmount = getNumber(state.config?.buy_in?.amount);
   const rebuyAmount = getNumber(state.config?.rebuy?.amount);
-  const currency = state.config?.buy_in?.currency || state.config?.rebuy?.currency || '';
+  const addonAmount = getNumber(state.config?.addon?.amount);
+  const currency =
+    state.config?.buy_in?.currency ||
+    state.config?.rebuy?.currency ||
+    state.config?.addon?.currency ||
+    '';
   const totalBasePrize = Number.isFinite(baseAmount) ? baseAmount * state.players.length : null;
   const totalRebuyPrize = Number.isFinite(rebuyAmount) ? rebuyAmount * state.totalRebuys : 0;
-  if (totalBasePrize !== null || totalRebuyPrize > 0) {
-    const totalPrize = (totalBasePrize ?? 0) + totalRebuyPrize;
+  const totalAddonPrize = Number.isFinite(addonAmount) ? addonAmount * state.totalAddons : 0;
+  if (totalBasePrize !== null || totalRebuyPrize > 0 || totalAddonPrize > 0) {
+    const totalPrize = (totalBasePrize ?? 0) + totalRebuyPrize + totalAddonPrize;
     lines.push(`Prize pool: <b>${escapeHtml(formatAmount(totalPrize, currency))}</b>`);
   }
 
@@ -343,6 +486,7 @@ function formatMetrics(state) {
   );
 
   lines.push(`Rebuys logged: <b>${state.totalRebuys}</b>`);
+  lines.push(`Add-ons logged: <b>${state.totalAddons}</b>`);
 
   const level = state.levels[state.currentLevelIndex];
   if (level) {
@@ -454,6 +598,7 @@ async function restartCurrentLevel(botInstance, chatId, state) {
 function scheduleLevelTimers(botInstance, chatId, state, level, label) {
   const durationMinutes = getLevelDurationMinutes(level);
   if (!durationMinutes) {
+    scheduleMetricsInterval(botInstance, chatId, state);
     return;
   }
   const durationMs = durationMinutes * 60 * 1000;
@@ -475,6 +620,8 @@ function scheduleLevelTimers(botInstance, chatId, state, level, label) {
       console.error('Failed to start the next level', error)
     );
   }, durationMs);
+
+  scheduleMetricsInterval(botInstance, chatId, state);
 }
 
 function clearLevelTimers(state) {
@@ -486,6 +633,22 @@ function clearLevelTimers(state) {
     clearTimeout(state.levelTimers.end);
     state.levelTimers.end = null;
   }
+  if (state.levelTimers.metricsInterval) {
+    clearInterval(state.levelTimers.metricsInterval);
+    state.levelTimers.metricsInterval = null;
+  }
+}
+
+function scheduleMetricsInterval(botInstance, chatId, state) {
+  if (state.levelTimers.metricsInterval) {
+    clearInterval(state.levelTimers.metricsInterval);
+  }
+
+  state.levelTimers.metricsInterval = setInterval(() => {
+    updateMetricsMessage(botInstance, chatId, state).catch((error) =>
+      console.error('Failed to refresh metrics message', error)
+    );
+  }, 60 * 1000);
 }
 
 function buildPlayerKeyboard(state, prefix, filterFn) {
@@ -509,6 +672,9 @@ function getMetricsKeyboard() {
   return Markup.inlineKeyboard([
     [
       Markup.button.callback('♻️ Rebuy', ACTION_REBUY),
+      Markup.button.callback('➕ Add-on', ACTION_ADDON)
+    ],
+    [
       Markup.button.callback('❌ Eliminate Player', ACTION_ELIMINATE)
     ],
     [
@@ -519,6 +685,15 @@ function getMetricsKeyboard() {
 }
 
 function formatLevelLabel(level, index) {
+  if (level.break || level.type === 'break') {
+    const duration = getLevelDurationMinutes(level);
+    const parts = [level.label || 'Break'];
+    if (Number.isFinite(duration)) {
+      parts.push(`${duration}m`);
+    }
+    return parts.join(' – ');
+  }
+
   const levelNumber = level.level || level.level_number || level.number || index + 1;
   const sb = getNumber(level.small_blind || level.smallBlind || level.sb);
   const bb = getNumber(level.big_blind || level.bigBlind || level.bb);
@@ -546,7 +721,8 @@ function getLevelDurationMinutes(level) {
     level.duration,
     level.minutes,
     level.time_minutes,
-    level.timeMinutes
+    level.timeMinutes,
+    level.time
   ];
   for (const value of candidates) {
     const number = getNumber(value);
@@ -634,6 +810,16 @@ function loadConfig() {
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function resolveNumber(...values) {
+  for (const value of values) {
+    const number = getNumber(value);
+    if (Number.isFinite(number)) {
+      return number;
+    }
+  }
+  return NaN;
 }
 
 async function safeEditMessageText(ctx, text) {
