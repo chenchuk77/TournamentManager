@@ -68,6 +68,7 @@ const ACTION_ADDON = 'action:addon';
 const ACTION_ELIMINATE = 'action:eliminate';
 const ACTION_RESET_ROUND = 'action:reset_round';
 const ACTION_SKIP_ROUND = 'action:skip_round';
+const ACTION_SHOW_GAME_STATUS = 'show:game_status';
 const ACTION_SHOW_REBUY_HISTORY = 'show:rebuys';
 const ACTION_SHOW_ADDON_HISTORY = 'show:addons';
 const ACTION_SHOW_ELIMINATIONS = 'show:eliminations';
@@ -364,6 +365,31 @@ bot.action(ACTION_RESET_TOURNAMENT, async (ctx) => {
   await promptForGameSelection(ctx, newState);
   await promptForRoleSelection(ctx, newState);
   await updateMetricsMessage(bot, chatId, newState, { repost: true });
+});
+
+bot.action(ACTION_SHOW_GAME_STATUS, async (ctx) => {
+  const chatId = ctx.chat?.id;
+  const userId = ctx.from?.id;
+  if (!chatId) {
+    return;
+  }
+
+  const state = chatStates.get(chatId);
+  if (!state) {
+    await ctx.answerCbQuery('No active tournament.');
+    return;
+  }
+
+  if (!userId || !getUserRole(state, userId)) {
+    await ctx.answerCbQuery('Please choose Player or Dealer access with /start.', {
+      show_alert: true
+    });
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  await ctx.replyWithHTML(formatMetrics(state));
+  await updateMetricsMessage(bot, chatId, state, { repost: true });
 });
 
 bot.action(ACTION_SHOW_REBUY_HISTORY, async (ctx) => {
@@ -1176,6 +1202,7 @@ function buildPlayerKeyboard(state, prefix, filterFn) {
 
 function getMetricsKeyboard(state) {
   const rows = [
+    [Markup.button.callback('🎯 Show Game', ACTION_SHOW_GAME_STATUS)],
     [
       Markup.button.callback('📋 Show Rebuys', ACTION_SHOW_REBUY_HISTORY),
       Markup.button.callback('📈 Show Add-ons', ACTION_SHOW_ADDON_HISTORY)
