@@ -2,3 +2,4 @@ node_modules/
 server/tournament-state.json
 .env
 npm-debug.log
+logs/
